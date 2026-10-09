@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>去黑边效果对比</title>
+<style>
+  :root { --bg:#f4f4f2; --fg:#222; --muted:#777; --line:#d8d8d4; --card:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161616; --fg:#eee; --muted:#999; --line:#333; --card:#222; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px 16px 40px; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  h1 { margin:0 0 4px; font-size:20px; }
+  p.sub { margin:0 0 20px; color:var(--muted); }
+  .scroll { overflow-x:auto; padding-bottom:12px; }
+  .grid { display:grid; grid-template-columns: 72px repeat(11, 300px); gap:12px; width:max-content; }
+  .rowlabel { align-self:center; writing-mode:vertical-rl; letter-spacing:.3em; font-weight:600;
+              text-align:center; color:var(--muted); }
+  .cell { margin:0; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:8px; }
+  .cell img { display:block; width:100%; height:auto; background:#fff; }
+  .cell figcaption { margin-top:6px; text-align:center; color:var(--muted); font-size:12px; }
+  .head { text-align:center; font-weight:600; }
+  .gap { grid-column:1 / -1; height:8px; border-bottom:1px dashed var(--line); }
+</style>
+</head>
+<body>
+  <h1>去黑边效果对比</h1>
+  <p class="sub">上排为原图（test/），下排为处理结果（output/），同一列一一对应；可左右滚动。</p>
+  <div class="scroll">
+    <div class="grid" id="grid"></div>
+  </div>
+<script>
+  // 文件名与后缀与 test/、output/ 目录一致
+  const files = ["1.png","2.jpg","3.jpg","4.jpg","5.jpg","6.jpg","7.jpg","8.jpg","9.jpg","10.jpg","11.jpg"];
+  const g = document.getElementById("grid");
+  const add = (html) => g.insertAdjacentHTML("beforeend", html);
+  add('<div></div>' + files.map((f,i) => `<div class="head">${i+1}</div>`).join(""));
+  add('<div class="rowlabel">原图</div>' + files.map(f =>
+    `<figure class="cell"><img src="test/${f}" alt="原图 ${f}"><figcaption>test/${f}</figcaption></figure>`).join(""));
+  add('<div class="gap"></div>');
+  add('<div class="rowlabel">结果</div>' + files.map(f =>
+    `<figure class="cell"><img src="output/${f}" alt="结果 ${f}"><figcaption>output/${f}</figcaption></figure>`).join(""));
+</script>
+</body>
+</html>

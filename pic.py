@@ -64,9 +64,21 @@ def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, mar
     k3 = np.ones((3, 3), np.uint8)
     for _ in range(max(margin, 1) * 3):
         seed = cv2.dilate(seed, k3) & np.maximum(soft, seed)
+    core = cv2.dilate(seed, np.ones((margin * 2 + 1,) * 2, np.uint8))
     # 黑边内侧通常还有一圈偏亮的扫描过曝带或残余暗线，按图像大小再向外多扩一些一并修补
     r = max(margin, int(round(0.022 * min(H, W))))
-    return cv2.dilate(seed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+    grown = cv2.dilate(seed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+    # 但紧挨黑边的手写/印刷字符不能被扩展区吞掉：保护扩展区里“像字”的墨迹块（细长线条不保护）
+    ink = ((gray < int(np.mean(bg)) * 0.65) & (core == 0)).astype(np.uint8)
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    protect = np.zeros((H, W), np.uint8)
+    for i in range(1, n2):
+        x, y, w, h, area = st2[i]
+        line_like = min(w, h) <= 6 and max(w, h) > 8 * min(w, h)
+        if area >= 30 and not line_like and (grown[y:y + h, x:x + w] > 0).any():
+            protect[y:y + h, x:x + w][lab2[y:y + h, x:x + w] == i] = 255
+    protect = cv2.dilate(protect, np.ones((5, 5), np.uint8))
+    return core | (grown & ~protect)
 
 
 def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
@@ -104,10 +116,16 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
     n2, lab2, st2, cen2 = cv2.connectedComponentsWithStats(ink, connectivity=8)
     speck = max(8, int(0.03 * min(H, W)))
     radius = 0.05 * min(H, W)
+    near = int(0.03 * min(H, W))  # 黑边清除后，被截断的笔迹离边缘仍会留有一小段距离
     for i in range(1, n2):
         w, h = st2[i, 2], st2[i, 3]
         cx, cy = cen2[i]
         if not outside[int(min(cy, H - 1)), int(min(cx, W - 1))]:
+            continue
+        x, y = st2[i, 0], st2[i, 1]
+        # 版心之外、紧贴（或被截断于）图片边缘的笔迹：多半是相邻页透过来的字或扫描残留，直接去掉
+        if x <= near or y <= near or x + w >= W - near or y + h >= H - near:
+            kill[lab2 == i] = 255
             continue
         if max(w, h) > speck or max(w, h) > 3 * min(w, h):
             continue
@@ -158,8 +176,15 @@ def inpaint(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
         return img
     H, W = img.shape[:2]
     scale = max(1.0, min(H, W) / 600)  # 在缩小图上修补，大面积也快
+    # 掩码附近的字迹也当作“未知”参与修补计算，否则会把笔画的深色抹进修补区形成灰色拖影；
+    # 最终只替换原掩码内的像素，这些字迹本身保持原样
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ink = (gray < float(np.median(gray)) * 0.65).astype(np.uint8)
+    reach = max(3, int(0.03 * min(H, W)))
+    near = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2))
+    work = mask | cv2.dilate(ink & near, np.ones((5, 5), np.uint8))
     small = cv2.resize(img, (int(W / scale), int(H / scale)), interpolation=cv2.INTER_AREA)
-    m = cv2.resize(mask, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST)
+    m = cv2.resize(work, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST)
     m = cv2.dilate(m, np.ones((3, 3), np.uint8))
     fixed = cv2.inpaint(small, m, 5, cv2.INPAINT_TELEA)
     fixed = cv2.resize(fixed, (W, H), interpolation=cv2.INTER_CUBIC).astype(np.float32)

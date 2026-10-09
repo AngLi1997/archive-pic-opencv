@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# 测试图片与处理结果
+test/
+output/
