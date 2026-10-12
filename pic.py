@@ -586,6 +586,23 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
         xy = np.r_[cen2[b2], cen3[b3]]
         return not (np.hypot(xy[:, 0] - cx, xy[:, 1] - cy) < radius).any()
 
+    # 笔画构成的字（字大小、填充率低，不含长线、表格框、实心墨团）：紧挨着它、落在同一行中段的
+    # 短横或小点是标点（如页码“- 2 -”两侧的短横）
+    sz2 = np.maximum(st2[big2, 2], st2[big2, 3])
+    char2 = big2[(sz2 <= 2 * char_h) & (st2[big2, 3] >= 0.4 * char_h)
+                 & (st2[big2, 4] < 0.45 * st2[big2, 2] * st2[big2, 3])]
+
+    def beside_char(x: int, y: int, w: int, h: int) -> bool:
+        dash = w >= 2 * h and h <= 0.25 * char_h
+        dot = max(w, h) <= 0.25 * char_h
+        if not (dash or dot):
+            return False
+        bx, by, bw, bh = (st2[char2, k] for k in range(4))
+        cy = y + h / 2
+        mid = (by + 0.2 * bh <= cy) & (cy <= by + 0.8 * bh)
+        gap = np.maximum(bx - (x + w), x - (bx + bw))  # 水平间距，重叠时为负
+        return bool((mid & (gap >= 0) & (gap <= char_h)).any())
+
     blob = np.zeros((H, W), np.uint8)  # 较大的墨团，外面还会再清一圈淡晕
 
     def erase(sel: np.ndarray, x: int, y: int, w: int, h: int, halo: bool) -> None:
@@ -629,6 +646,9 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
         # 周围墨迹块不超过两个（旧规则），或者附近只有噪点、没有大墨迹（灰色的成片噪点）
         few = int((np.hypot(cen2[1:, 0] - cx, cen2[1:, 1] - cy) < radius).sum()) - 1 <= 2
         if not few and (colored(sel, x, y, w, h) or not no_big_near(cx, cy, i, np.unique(lab3[y:y + h, x:x + w][sel]))):
+            continue
+        if beside_char(x, y, w, h):
+            log.debug("    保留字旁的标点 (%d,%d) %dx%d", x, y, w, h)
             continue
         erase(sel, x, y, w, h, halo=True)
         n_speck += 1
