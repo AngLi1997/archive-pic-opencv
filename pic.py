@@ -33,7 +33,8 @@ def dominant_color(img: np.ndarray, mask: np.ndarray) -> tuple[int, int, int]:
     keys = (pixels // 8).astype(np.int32)
     flat = keys[:, 0] * 1024 + keys[:, 1] * 32 + keys[:, 2]
     top = np.bincount(flat).argmax()
-    return tuple(int(v) for v in pixels[flat == top].mean(axis=0))
+    b, g, r = (int(v) for v in pixels[flat == top].mean(axis=0))
+    return b, g, r
 
 
 def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, margin: int) -> np.ndarray:
@@ -63,7 +64,7 @@ def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, mar
     soft = (gray < min(int(np.mean(bg)) - 40, 190)).astype(np.uint8)
     k3 = np.ones((3, 3), np.uint8)
     for _ in range(max(margin, 1) * 3):
-        seed = cv2.dilate(seed, k3) & np.maximum(soft, seed)
+        seed = cv2.bitwise_and(cv2.dilate(seed, k3), np.maximum(soft, seed))
     core = cv2.dilate(seed, np.ones((margin * 2 + 1,) * 2, np.uint8))
     # 黑边内侧通常还有一圈偏亮的扫描过曝带或残余暗线，按图像大小再向外多扩一些一并修补
     r = max(margin, int(round(0.022 * min(H, W))))
@@ -78,7 +79,7 @@ def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, mar
         if area >= 30 and not line_like and (grown[y:y + h, x:x + w] > 0).any():
             protect[y:y + h, x:x + w][lab2[y:y + h, x:x + w] == i] = 255
     protect = cv2.dilate(protect, np.ones((5, 5), np.uint8))
-    return core | (grown & ~protect)
+    return cv2.bitwise_or(core, cv2.bitwise_and(grown, cv2.bitwise_not(protect)))
 
 
 def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
@@ -87,14 +88,20 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     paper = float(np.mean(bg))
     ink = (gray < paper * 0.65).astype(np.uint8)
+    n2, lab2, st2, cen2 = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    # 典型字高：取较大墨迹块高度的 75 分位（汉字常被拆成几个部件，取偏上的分位更接近整字高度）
+    hs = st2[1:, 3]
+    hs = hs[hs > max(10, H // 350)]
+    char_h = float(np.percentile(hs, 75)) if hs.size else 0.015 * H
 
     # 1. 把字符横向合并成行，用墨迹量足够大的连通域确定版心
     merge = cv2.getStructuringElement(cv2.MORPH_RECT, (max(W // 25, 3), max(H // 200, 3)))
     n, lab, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(ink, merge), connectivity=8)
-    ink_cnt = np.bincount(lab.ravel(), weights=ink.ravel(), minlength=n)[1:]
+    ink_cnt = np.bincount(lab.ravel().astype(np.int32, copy=False), weights=ink.ravel(), minlength=n)[1:]
     if ink_cnt.size == 0 or ink_cnt.max() == 0:
         return np.zeros((H, W), np.uint8)
-    big = np.flatnonzero(ink_cnt >= 0.25 * np.median(ink_cnt[ink_cnt > 0.1 * ink_cnt.max()])) + 1
+    # 墨迹量至少相当于一个字的才算正文行；不用“相对最大值”的比例，否则一张大照片会把所有文字行都筛掉
+    big = np.flatnonzero(ink_cnt >= 0.3 * char_h * char_h) + 1
     boxes = []  # 用墨迹本身的外框（而非膨胀后的）判断，避免细黑线因膨胀被当成正文
     for i in big:
         ys, xs = np.nonzero((lab == i) & (ink > 0))
@@ -113,8 +120,8 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
 
     # 2. 版心之外的孤立小块墨点：尺寸远小于一个字、接近“团块”形状，并且周围没有其他墨迹
     #    （细长的手写笔画如“1”不删；周围有一串字符的是正文，哪怕颜色浅、没被划进版心也不动）
-    n2, lab2, st2, cen2 = cv2.connectedComponentsWithStats(ink, connectivity=8)
-    speck = max(8, int(0.03 * min(H, W)))
+    # 噪点必须明显小于一个字：孤立的整字（如页码“3”、加粗的标题字）不会被误删
+    speck = max(6, int(0.43 * char_h))
     radius = 0.05 * min(H, W)
     near = int(0.03 * min(H, W))  # 黑边清除后，被截断的笔迹离边缘仍会留有一小段距离
     for i in range(1, n2):
@@ -127,7 +134,9 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
         if x <= near or y <= near or x + w >= W - near or y + h >= H - near:
             kill[lab2 == i] = 255
             continue
-        if max(w, h) > speck or max(w, h) > 3 * min(w, h):
+        # 接近字大小的块只有“实心墨团”才算噪点（笔画构成的字填充率低）
+        solid = st2[i, 4] >= 0.45 * w * h
+        if max(w, h) > (2 * speck if solid else speck) or max(w, h) > 3 * min(w, h):
             continue
         dist = np.hypot(cen2[1:, 0] - cx, cen2[1:, 1] - cy)
         if int((dist < radius).sum()) - 1 > 2:  # 减去自己；邻居多说明是文字
@@ -182,7 +191,7 @@ def inpaint(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     ink = (gray < float(np.median(gray)) * 0.65).astype(np.uint8)
     reach = max(3, int(0.03 * min(H, W)))
     near = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2))
-    work = mask | cv2.dilate(ink & near, np.ones((5, 5), np.uint8))
+    work = cv2.bitwise_or(mask, cv2.dilate(cv2.bitwise_and(ink, near), np.ones((5, 5), np.uint8)))
     small = cv2.resize(img, (int(W / scale), int(H / scale)), interpolation=cv2.INTER_AREA)
     m = cv2.resize(work, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST)
     m = cv2.dilate(m, np.ones((3, 3), np.uint8))
