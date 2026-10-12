@@ -1,6 +1,7 @@
-"""扫描件清理：去黑边、方向检测与旋转校正、去页边噪点。
+"""扫描件清理：去彩色噪点、去黑边、方向检测与旋转校正、去页边噪点。
 
 处理顺序：
+  0. 去除大面积浅色彩色噪点（粉色墨粉斑、彩色竖条纹等，颜色不写死，保留印章、红头）
   1. 去除贴边黑边、黑角与页边“边框带”（按原始扫描坐标处理）
   2. 方向检测（0/90/180/270°，Tesseract OSD），把文字转到朝上
   3. 小角度倾斜校正，旋转后露出的空角用周围纸张纹理修补
@@ -29,6 +30,21 @@ log = logging.getLogger("pic")
 
 # 噪点阈值默认值：孤立墨点的最大尺寸占典型字高的比例
 NOISE_RATIO = 0.43
+
+# 彩色噪点：Lab 色度（相对纸张底色）高于 COLOR_MIN 算“带颜色”，高于 COLOR_STRONG 算浓色内容（红头、印章）
+COLOR_MIN = 6.0
+COLOR_STRONG = 45.0
+# 只清除与噪点主色相相差不超过该角度的颜色
+COLOR_HUE_TOL = 35.0
+# 印章保护：色度高于该值的像素连成有厚度的块即视为印章（骑缝章颜色较浅，阈值低于 COLOR_STRONG）
+STAMP_CHROMA = 25.0
+# 骑缝章外圈检测：半径占图片短边的范围（A4 上 38~45mm 的公章约 0.09~0.11）、
+# 图内可见圆弧的最小角度、可见圆弧上有墨迹的最低比例
+STAMP_R_MIN = 0.05
+STAMP_R_MAX = 0.15
+STAMP_ARC_MIN_DEG = 40.0
+STAMP_ARC_COVER = 0.6
+STAMP_ARC_RUN = 4  # 圆周按 2° 采样，连续命中 4 个采样点（8°）才算一段圆弧
 
 # 方向检测：OSD 输入图的最长边；每次检测的最低置信度
 OSD_MAX_SIDE = 2000
@@ -71,13 +87,183 @@ def dominant_color(img: np.ndarray, mask: np.ndarray) -> tuple[int, int, int]:
     return b, g, r
 
 
-def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, margin: int) -> np.ndarray:
-    """与图片边缘相连的黑色区域（黑边、三角黑角、撕裂的黑块）的掩码。
+def stamp_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
+    """骑缝章（压在页边、被图片边缘截断的印章）的保护掩码：任何清除步骤都不得改动其中的像素。
 
-    只处理“接触图片边缘”的深色连通域，页面内部的手写、印刷文字不会被触及。
+    骑缝章颜色往往很浅、又紧贴图片边缘，容易被当成黑边过渡带或贴边残迹清掉。两条线索取并集：
+      - 颜色：贴边、有厚度的带色块（彩色扫描）；
+      - 形状：贴边的残缺圆弧，即印章外圈（黑白扫描时颜色线索失效，靠它识别）。
+    页面内部的印章不贴边，本来就不会被清除，这里不管。
     """
     H, W = img.shape[:2]
-    gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+    keep = cv2.bitwise_or(color_stamp_mask(img, bg), arc_stamp_mask(img, bg))
+    if keep.any():
+        r = max(3, int(0.01 * min(H, W)))
+        keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+        log.info("  印章保护: %.2f%% 的面积", 100 * float(np.count_nonzero(keep)) / keep.size)
+    return keep
+
+
+def color_stamp_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
+    """贴边的彩色印章块。
+
+    按 Lab 色度（相对纸张底色）找带色像素，闭运算把印章的笔画连成整块，只保留贴边、有厚度、有面积的块；
+    黑边、直线旁扫描产生的 1~3px 色差彩边很细，不会被当成印章。
+    """
+    H, W = img.shape[:2]
+    side = min(H, W)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    paper_lab = cv2.cvtColor(np.full((1, 1, 3), bg, np.uint8), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    chroma = np.hypot(lab[..., 1] - paper_lab[1], lab[..., 2] - paper_lab[2])
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 黑边里偏色的暗像素不算（印章再浓也不会接近黑色）
+    core = ((chroma > STAMP_CHROMA) & (gray > float(np.mean(bg)) * 0.35)).astype(np.uint8)
+    keep = np.zeros((H, W), np.uint8)
+    if not core.any():
+        return keep
+    # 印章的字之间有空隙：大核闭运算把同一枚印章的笔画连成整块
+    k = max(5, int(0.03 * side) | 1)
+    blob = cv2.morphologyEx(core, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    n, lab_b, st, _ = cv2.connectedComponentsWithStats(blob, connectivity=8)
+    # 厚度用距离变换衡量（L 形的细彩边外框也很大，但内部最厚处只有几个像素）
+    depth = cv2.distanceTransform(blob, cv2.DIST_L2, 3)
+    thick, min_px, edge = max(3.0, 0.004 * side), max(30, int(0.00003 * H * W)), max(3, int(0.02 * side))
+    found = np.zeros(n, bool)
+    for i in range(1, n):
+        x, y, w, h, _ = st[i]
+        if not (x <= edge or y <= edge or x + w >= W - edge or y + h >= H - edge):
+            continue
+        sel = lab_b[y:y + h, x:x + w] == i
+        cnt = int(core[y:y + h, x:x + w][sel].sum())
+        if float(depth[y:y + h, x:x + w][sel].max()) >= thick and cnt >= min_px:
+            found[i] = True
+            log.debug("    贴边彩色印章 (%d,%d) %dx%d（带色像素 %d）", x, y, w, h, cnt)
+    if not found.any():
+        return keep
+    # 同一枚印章里离得稍远的零散笔画（较淡的偏旁、印边的残笔）也一并保护
+    r = max(5, int(0.05 * side))
+    near = cv2.dilate(found[np.asarray(lab_b, np.int32)].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+    hit = np.zeros(n, bool)
+    hit[np.unique(np.asarray(lab_b, np.int32)[(np.asarray(near) > 0) & (np.asarray(blob) > 0)])] = True
+    hit[0] = False
+    return hit[np.asarray(lab_b, np.int32)].astype(np.uint8) * 255
+
+
+def arc_stamp_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
+    """被图片边缘截断的印章外圈（残缺圆弧）所围的圆形区域，不依赖颜色。
+
+    把四条边依次转到右侧，在贴边条带内对“细线状”的墨迹做 RANSAC 拟合圆：
+      - 半径在印章的常见范围内（STAMP_R_MIN~STAMP_R_MAX × 短边），圆被右边缘截断；
+      - 圆周在图片内的可见部分至少 STAMP_ARC_MIN_DEG 度，其中 ≥ STAMP_ARC_COVER 被连续的墨迹段覆盖；
+      - 圆周外侧、内侧各一圈几乎没有墨迹（是一条孤立的线，而不是成片的文字、手写、黑边）。
+    """
+    H, W = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    keep = np.zeros((H, W), np.uint8)
+    for t in (0, 90, 180, 270):  # 依次把上/右/下/左边转到右侧处理
+        g = rotate_cw(gray, t)
+        m = _arc_on_right(g, float(np.mean(bg)), min(H, W), t)
+        if m is not None:
+            keep |= rotate_cw(m, (360 - t) % 360)
+    return keep
+
+
+def _arc_on_right(g: np.ndarray, paper: float, side: int, t: int) -> np.ndarray | None:
+    h, w = g.shape
+    rmin, rmax = STAMP_R_MIN * side, STAMP_R_MAX * side
+    x_off = max(0, w - int(2.2 * rmax))  # 只看贴右边的条带，圆整个落在条带内
+    sub = g[:, x_off:]
+    sw = sub.shape[1]
+    ink = (sub < paper - 40).astype(np.uint8)
+    # 去掉成块的黑边、黑角，只留线状墨迹（印章外圈是 1~2mm 宽的线）
+    k = max(9, int(0.02 * side) | 1)
+    ink &= cv2.bitwise_not(cv2.dilate(cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((k, k), np.uint8)),
+                                      np.ones((5, 5), np.uint8))) // 255
+    # 去掉表格线、黑边带等长直线：圆与直线相切时会重叠一段，造成假的“连续圆弧”。
+    # 外圈在这个长度上弯曲得明显（偏离直线远超线宽），不会被去掉
+    L = max(15, int(0.1 * side))
+    straight = cv2.bitwise_or(cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((1, L), np.uint8)),
+                              cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((L, 1), np.uint8)))
+    ink &= 1 - cv2.dilate(straight, np.ones((5, 5), np.uint8))
+    ys, xs = np.nonzero(ink)
+    if xs.size < 50:
+        return None
+    rng = np.random.default_rng(0)  # 固定种子，结果可复现
+    if xs.size > 20000:
+        idx = rng.choice(xs.size, 20000, replace=False)
+        xs, ys = xs[idx], ys[idx]
+    tol = max(2.0, 0.004 * side)
+    dist = cv2.distanceTransform(1 - ink, cv2.DIST_L2, 3)
+
+    # 随机取三点求外接圆
+    N = 30000
+    i = rng.integers(0, xs.size, (3, N))
+    x1, y1, x2, y2, x3, y3 = (v.astype(np.float64) for v in (xs[i[0]], ys[i[0]], xs[i[1]], ys[i[1]], xs[i[2]], ys[i[2]]))
+    d = 2 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+    ok = np.abs(d) > 1e-6
+    d = np.where(ok, d, 1.0)
+    s1, s2, s3 = x1 ** 2 + y1 ** 2, x2 ** 2 + y2 ** 2, x3 ** 2 + y3 ** 2
+    cx = (s1 * (y2 - y3) + s2 * (y3 - y1) + s3 * (y1 - y2)) / d
+    cy = (s1 * (x3 - x2) + s2 * (x1 - x3) + s3 * (x2 - x1)) / d
+    r = np.hypot(x1 - cx, y1 - cy)
+    # 被右边缘截断：圆超出右边缘，且图内至少露出 1/5 个直径
+    ok &= (r >= rmin) & (r <= rmax) & (cx + r > sw + tol) & (cx <= sw + 0.6 * r) & (cx - r >= 0)
+    ok &= (cy > -0.5 * r) & (cy < h + 0.5 * r)
+    if not ok.any():
+        return None
+    cx, cy, r = cx[ok], cy[ok], r[ok]
+
+    def score(cx, cy, r):
+        ang = np.radians(np.arange(0, 360, 2.0))
+        px = cx[:, None] + r[:, None] * np.cos(ang)
+        py = cy[:, None] + r[:, None] * np.sin(ang)
+        vis = (px >= 0) & (px < sw - 1) & (py >= 0) & (py < h - 1)
+        pxi, pyi = np.clip(px, 0, sw - 1).astype(int), np.clip(py, 0, h - 1).astype(int)
+        nvis = vis.sum(1)
+        hit = (dist[pyi, pxi] <= tol) & vis
+        # 只算连成长段（≥ STAMP_ARC_RUN 个采样点，即 8°）的命中：外圈是连续的弧，手写笔画只是零星穿过圆周
+        L = STAMP_ARC_RUN
+        ext = np.concatenate([hit, hit[:, :L - 1]], axis=1).astype(np.int32)  # 首尾相接，处理跨 0° 的弧
+        c = np.concatenate([np.zeros((len(cx), 1), np.int32), np.cumsum(ext, axis=1)], axis=1)
+        full = (c[:, L:] - c[:, :-L]) == L  # 从第 j 个采样点起连续 L 个都命中
+        run = np.zeros_like(hit)
+        for k in range(L):
+            run |= np.roll(full, k, axis=1)
+        cover = (run & vis).sum(1) / np.maximum(nvis, 1)
+        def ring(dr: float) -> np.ndarray:  # 半径偏移 dr 处一圈上有墨迹的比例
+            qx = np.clip(cx[:, None] + (r[:, None] + dr) * np.cos(ang), 0, sw - 1).astype(int)
+            qy = np.clip(cy[:, None] + (r[:, None] + dr) * np.sin(ang), 0, h - 1).astype(int)
+            return ((ink[qy, qx] > 0) & vis).sum(1) / np.maximum(nvis, 1)
+        # 外圈是一条孤立的线：外侧是空白，内侧到印文之间也有一圈空隙；手写字、文字串会同时落在两侧
+        return nvis * 2.0, cover, np.maximum(ring(3 * tol), ring(-2.5 * tol))
+
+    span, cover, side_ink = score(cx, cy, r)
+    good = (span >= STAMP_ARC_MIN_DEG) & (cover >= STAMP_ARC_COVER) & (side_ink <= 0.15)
+    if not good.any():
+        return None
+    # 印章里的内圈、环形排列的印文也能拟合出圆，但它们两侧还有墨迹；外圈两侧最干净，优先取外圈
+    b = int(np.argmax(np.where(good, (cover - 2 * side_ink) * span, -np.inf)))
+    cx0, cy0, r0 = float(cx[b]), float(cy[b]), float(r[b])
+    # 用圆周附近的墨迹点做最小二乘精修（代数拟合）
+    near = np.abs(np.hypot(xs - cx0, ys - cy0) - r0) <= 2 * tol
+    if near.sum() >= 10:
+        A = np.c_[2 * xs[near], 2 * ys[near], np.ones(near.sum())]
+        sol, *_ = np.linalg.lstsq(A, xs[near] ** 2.0 + ys[near] ** 2.0, rcond=None)
+        c1, c2 = float(sol[0]), float(sol[1])
+        r1 = float(np.sqrt(max(sol[2] + c1 ** 2 + c2 ** 2, 0)))
+        sp1, cv1, _ = score(np.array([c1]), np.array([c2]), np.array([r1]))
+        if rmin <= r1 <= rmax and cv1[0] >= cover[b]:
+            cx0, cy0, r0 = c1, c2, r1
+    log.debug("    贴边残缺圆弧（边 %d°）：圆心 (%.0f,%.0f) 半径 %.0f，可见 %.0f°，覆盖 %.2f，两侧 %.2f",
+              t, cx0 + x_off, cy0, r0, span[b], cover[b], side_ink[b])
+    m = np.zeros((h, w), np.uint8)
+    cv2.circle(m, (int(round(cx0 + x_off)), int(round(cy0))), int(round(r0 + 2 * tol)), 255, -1)
+    return m
+
+
+def edge_dark_seed(gray: np.ndarray, bg: tuple[int, int, int], thresh: int) -> np.ndarray:
+    """与图片边缘相连的深色连通域，加上最外圈几个像素里偏暗的残留：黑边的“种子”。"""
+    H, W = gray.shape
     dark = (gray < thresh).astype(np.uint8)
     n, lab, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
     min_area = max(30, int(H * W * 0.00005))
@@ -91,11 +277,56 @@ def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, mar
     f = 4
     frame = np.zeros((H, W), np.uint8)
     frame[:f], frame[-f:], frame[:, :f], frame[:, -f:] = 255, 255, 255, 255
-    seed |= frame & (gray < int(np.mean(bg)) - 40).astype(np.uint8) * 255
+    return seed | (frame & (gray < int(np.mean(bg)) - 40).astype(np.uint8) * 255)
+
+
+def trim_keep_at_border(keep: np.ndarray, img: np.ndarray, bg: tuple[int, int, int], thresh: int,
+                        margin: int) -> np.ndarray:
+    """从印章保护区里扣掉压在章上的那一段黑边带。
+
+    黑边沿整条边延伸，在保护区内的厚度按保护区两侧（保护区之外）测得的黑边厚度插值；
+    只扣掉紧贴边缘的这一条，被黑边盖住的那点印章本来就看不见了，章的其余部分照常保护。
+    """
+    if not keep.any():
+        return keep
+    gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+    seed = edge_dark_seed(gray, bg, thresh)
+    band = np.zeros_like(keep)
+    for t in (0, 90, 180, 270):  # 依次把四条边转到右侧处理
+        sd, kp = rotate_cw(seed, t) > 0, rotate_cw(keep, t) > 0
+        h, w = sd.shape
+        under = kp[:, -1]  # 保护区压到右边缘的那些行
+        if not under.any() or under.all():
+            continue
+        # 每行从右边缘起连续的深色像素数，即这一行黑边的厚度
+        run = np.where(sd[:, ::-1].all(axis=1), w, np.argmin(sd[:, ::-1], axis=1)).astype(np.float64)
+        rows = np.arange(h)
+        est = np.interp(rows[under], rows[~under], run[~under])
+        est = np.where(est > 0, est + 2 * margin, 0)  # 加上黑边外侧的灰色过渡
+        m = np.zeros((h, w), np.uint8)
+        m[rows[under][:, None], np.arange(w)[None, :]] = (np.arange(w)[None, :] >= w - est[:, None]) * 255
+        band |= rotate_cw(m, (360 - t) % 360)
+    if band.any():
+        log.debug("    保护区内压着黑边带 %d 像素，照常清除", int(np.count_nonzero(band & keep)))
+    return cv2.bitwise_and(keep, cv2.bitwise_not(band))
+
+
+def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, margin: int,
+                     keep: np.ndarray | None = None) -> np.ndarray:
+    """与图片边缘相连的黑色区域（黑边、三角黑角、撕裂的黑块）的掩码。
+
+    只处理“接触图片边缘”的深色连通域，页面内部的手写、印刷文字不会被触及。
+    keep: 印章保护掩码，其中的像素既不作为种子、也不会被生长吞掉。
+    """
+    H, W = img.shape[:2]
+    gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+    seed = edge_dark_seed(gray, bg, thresh)
+    free = np.full((H, W), 255, np.uint8) if keep is None else cv2.bitwise_not(keep)
+    seed &= free
     if not seed.any():
         return seed
     # 沿渐变的灰色过渡带向外生长（受限于较亮的灰度上限），吃掉黑边的抗锯齿/阴影边缘
-    soft = (gray < min(int(np.mean(bg)) - 40, 190)).astype(np.uint8)
+    soft = (gray < min(int(np.mean(bg)) - 40, 190)).astype(np.uint8) & (free > 0)
     k3 = np.ones((3, 3), np.uint8)
     for _ in range(max(margin, 1) * 3):
         seed = cv2.bitwise_and(cv2.dilate(seed, k3), np.maximum(soft, seed))
@@ -113,7 +344,120 @@ def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, mar
         if area >= 30 and not line_like and (grown[y:y + h, x:x + w] > 0).any():
             protect[y:y + h, x:x + w][lab2[y:y + h, x:x + w] == i] = 255
     protect = cv2.dilate(protect, np.ones((5, 5), np.uint8))
-    return cv2.bitwise_or(core, cv2.bitwise_and(grown, cv2.bitwise_not(protect)))
+    return cv2.bitwise_and(cv2.bitwise_or(core, cv2.bitwise_and(grown, cv2.bitwise_not(protect))), free)
+
+
+def color_noise_clean(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
+    """去除大面积、浅淡的彩色噪点（复印机的粉色墨粉斑、扫描仪的彩色竖条纹等），颜色不写死。
+
+    “彩色”按 Lab 色度相对纸张底色计算，所以任何颜色的噪点都能识别；区分噪点与彩色内容靠三点：
+      - 浓：色度高的像素（红头、印章的笔画）及其周围不动；
+      - 深：深色墨迹（哪怕本身带颜色，如粉色复印件上的字）及紧贴它的边缘不动；
+      - 散：剩下的浅色彩色像素按密度连成区域，只有铺满大片、或贯穿页面一大段的区域才算噪点；
+        浅淡的印章是一个紧凑的圆，不会被当成噪点。
+    噪点像素按色度渐变地替换为纸张底色。
+    """
+    H, W = img.shape[:2]
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    paper_lab = cv2.cvtColor(np.uint8([[bg]]), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    chroma = np.hypot(lab[..., 1] - paper_lab[1], lab[..., 2] - paper_lab[2])
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    paper = float(np.mean(bg))
+    side = min(H, W)
+
+    strong = (chroma > COLOR_STRONG).astype(np.uint8)
+    r = max(3, int(0.004 * side))
+    protect = cv2.dilate(strong, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+    dark = (gray < paper * 0.55).astype(np.uint8)
+    protect |= cv2.dilate(dark, np.ones((5, 5), np.uint8))
+    cand = ((chroma > COLOR_MIN) & (protect == 0)).astype(np.uint8)
+    if cand.mean() < 0.002:
+        return img
+
+    # 在缩小图上按密度连成区域
+    s = min(1.0, 800 / max(H, W))
+    size = (max(1, int(W * s)), max(1, int(H * s)))
+    small = cv2.resize(cand.astype(np.float32), size, interpolation=cv2.INTER_AREA)
+    strong_s = cv2.resize(strong.astype(np.float32), size, interpolation=cv2.INTER_AREA)
+    k = max(3, int(0.02 * min(small.shape)) | 1)
+    dens = cv2.blur(small, (k, k))
+    region = (dens > 0.08).astype(np.uint8)
+    region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    sh, sw = small.shape
+    # 印章状的区域：不贴图片边缘、大致成圆、有一定大小。先记下来，后面无论如何都不动
+    stamp = np.zeros((sh, sw), np.uint8)
+    n, lab_r, st, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        inner = x > 1 and y > 1 and x + w < sw - 1 and y + h < sh - 1
+        if inner and max(w, h) <= 2 * min(w, h) and 0.06 * min(sh, sw) <= max(w, h) <= 0.35 * min(sh, sw):
+            stamp[lab_r == i] = 255
+            log.debug("    彩色区域 (%d,%d) %dx%d 形似印章，保留（缩小图）", x, y, w, h)
+    stamp = cv2.dilate(stamp, np.ones((k, k), np.uint8))
+    # 条纹多是沿页边的长条，断断续续：顺着横、竖两个方向分别闭运算把断开的片段接起来
+    region |= cv2.morphologyEx(region, cv2.MORPH_CLOSE, np.ones((6 * k, 1), np.uint8))
+    region |= cv2.morphologyEx(region, cv2.MORPH_CLOSE, np.ones((1, 6 * k), np.uint8))
+    n, lab_r, st, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
+    noise = np.zeros((sh, sw), np.uint8)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        wide = area >= 0.05 * sh * sw or h >= 0.35 * sh or w >= 0.35 * sw
+        # 彩色照片、大面积彩色印刷也是“大片彩色”，但其中浓色像素多；噪点几乎全是浅淡的颜色
+        sel = lab_r == i
+        rich = float(strong_s[sel].sum()) / max(float(small[sel].sum() + strong_s[sel].sum()), 1e-6)
+        if wide and rich < 0.1:
+            noise[sel] = 255
+            log.debug("    彩色噪点区域 (%d,%d) %dx%d，浓色占比 %.2f（缩小图）", x, y, w, h, rich)
+        elif wide:
+            log.debug("    彩色区域 (%d,%d) %dx%d 浓色占比 %.2f，视为彩色内容保留（缩小图）", x, y, w, h, rich)
+    if not noise.any():
+        log.info("  彩色噪点: 未发现")
+        return img
+    noise = cv2.dilate(noise, np.ones((k, k), np.uint8))
+    noise[stamp > 0] = 0
+    noise = cv2.resize(noise, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    # 噪点的色相：噪点区域内浅色彩色像素的色相直方图峰值；只清这个色相附近的颜色，
+    # 这样噪点区域里别的颜色（如橙红色印章的浅色部分）不受影响
+    hue = (np.degrees(np.arctan2(lab[..., 2] - paper_lab[2], lab[..., 1] - paper_lab[1])) + 360) % 360
+    sel = (noise > 0) & (cand > 0)
+    hist = np.bincount((hue[sel] // 5).astype(np.int32) % 72, minlength=72).astype(np.float64)
+    hist = np.convolve(np.r_[hist[-2:], hist, hist[:2]], np.ones(5), "valid")
+    peak = float(np.argmax(hist)) * 5 + 2.5
+    # 色度很低时色相不稳定，不按色相筛
+    near_hue = (np.abs((hue - peak + 180) % 360 - 180) < COLOR_HUE_TOL) | (chroma < 2 * COLOR_MIN)
+    log.debug("    噪点色相 %.0f°（Lab a-b 平面）", peak)
+
+    # 色度越高越接近完全替换，低色度渐变，避免留下硬边
+    alpha = np.clip((chroma - COLOR_MIN / 3) / COLOR_MIN, 0, 1)
+    alpha[(noise == 0) | (protect > 0) | ~near_hue] = 0
+
+    # 墨粉斑里颜色较深的小点会被当成“深色墨迹”保护起来：噪点色相的、很小、周围没有别的墨迹的深色点也清掉
+    # （冒号、句号等标点挨着文字，不算孤立）
+    dots = (dark > 0) & (chroma > 2 * COLOR_MIN) & near_hue & (noise > 0)
+    n_d, lab_d, st_d, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    dot_max, iso = max(4, int(0.005 * side)), max(8, int(0.012 * side))
+    # 只看附近有没有“大”墨迹（字、线），成片的小噪点彼此挨着不影响判断
+    big = np.zeros(n_d, bool)
+    big[1:] = np.maximum(st_d[1:, 2], st_d[1:, 3]) > dot_max
+    big_ink = big[lab_d]
+    ys, xs = np.nonzero(dots)
+    n_dot = 0
+    for i in np.unique(lab_d[ys, xs]):
+        x, y, w, h, area = st_d[i]
+        if big[i]:
+            continue
+        x0, y0, x1, y1 = max(0, x - iso), max(0, y - iso), min(W, x + w + iso), min(H, y + h + iso)
+        if big_ink[y0:y1, x0:x1].any():
+            continue
+        comp = (lab_d[y0:y1, x0:x1] == i).astype(np.uint8)
+        alpha[y0:y1, x0:x1] = np.maximum(alpha[y0:y1, x0:x1], cv2.dilate(comp, np.ones((5, 5), np.uint8)))
+        n_dot += 1
+    log.debug("    清除孤立深色噪点 %d 个", n_dot)
+    alpha = cv2.GaussianBlur(alpha, (3, 3), 0)[..., None]
+    log.info("  彩色噪点: 清除 %.2f%% 的面积", 100 * float((alpha > 0.5).mean()))
+    out = img.astype(np.float32) * (1 - alpha) + np.float32(bg) * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: float = NOISE_RATIO) -> np.ndarray:
@@ -243,8 +587,13 @@ def edge_band_mask(img: np.ndarray) -> np.ndarray:
     return cv2.dilate(mask, np.ones((5, 5), np.uint8))
 
 
-def inpaint(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """用周围纸张纹理修补掩码区域，并在边界羽化过渡，避免出现色块和明显分界。"""
+def inpaint(img: np.ndarray, mask: np.ndarray, keep: np.ndarray | None = None) -> np.ndarray:
+    """用周围纸张纹理修补掩码区域，并在边界羽化过渡，避免出现色块和明显分界。
+
+    keep: 印章保护掩码，其中的像素原样保留（羽化也不会渗入）。
+    """
+    if keep is not None:
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(keep))
     if not mask.any():
         return img
     H, W = img.shape[:2]
@@ -256,6 +605,8 @@ def inpaint(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     reach = max(3, int(0.03 * min(H, W)))
     near = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1,) * 2))
     work = cv2.bitwise_or(mask, cv2.dilate(cv2.bitwise_and(ink, near), np.ones((5, 5), np.uint8)))
+    if keep is not None:  # 印章也不能当修补的取样来源，否则红色会被抹进修补区形成粉色光晕
+        work = cv2.bitwise_or(work, cv2.bitwise_and(keep, near))
     small = cv2.resize(img, (int(W / scale), int(H / scale)), interpolation=cv2.INTER_AREA)
     m = cv2.resize(work, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST)
     m = cv2.dilate(m, np.ones((3, 3), np.uint8))
@@ -265,6 +616,8 @@ def inpaint(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     sigma = max(1.0, 0.002 * min(H, W))
     alpha = cv2.GaussianBlur(mask.astype(np.float32) / 255, (0, 0), sigma)[..., None]
     alpha = np.maximum(alpha, (mask > 0)[..., None].astype(np.float32))
+    if keep is not None:
+        alpha[keep > 0] = 0
     return np.clip(img * (1 - alpha) + fixed * alpha, 0, 255).astype(np.uint8)
 
 
@@ -444,14 +797,16 @@ def content_mask(img: np.ndarray, paper: float) -> np.ndarray:
     return cv2.medianBlur(m, 3)  # 去掉 JPEG 噪声造成的单个像素
 
 
-def deskew(img: np.ndarray, angle: float, bg: tuple[int, int, int]) -> np.ndarray:
-    """按 angle（逆时针为正）旋转校正，空角用周围纸张纹理修补。
+def deskew(img: np.ndarray, angle: float, bg: tuple[int, int, int],
+           keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """按 angle（逆时针为正）旋转校正，空角用周围纸张纹理修补。返回 (校正后的图, 同样变换后的印章保护掩码)。
 
     默认保持原尺寸；若这样会把任何内容像素转出画布，则扩展画布以完整保留内容。
+    骑缝章本来就被图片边缘截断，再转出去几个像素不算丢内容，不为它扩展画布。
     """
     H, W = img.shape[:2]
     M = cv2.getRotationMatrix2D((W / 2, H / 2), angle, 1.0)
-    ys, xs = np.nonzero(content_mask(img, float(np.mean(bg))))
+    ys, xs = np.nonzero(content_mask(img, float(np.mean(bg))) & cv2.bitwise_not(keep))
     nx = M[0, 0] * xs + M[0, 1] * ys + M[0, 2]
     ny = M[1, 0] * xs + M[1, 1] * ys + M[1, 2]
     lost = int(((nx < 0) | (nx > W - 1) | (ny < 0) | (ny > H - 1)).sum())
@@ -469,7 +824,8 @@ def deskew(img: np.ndarray, angle: float, bg: tuple[int, int, int]) -> np.ndarra
     valid = cv2.warpAffine(np.full((H, W), 255, np.uint8), M, size, flags=cv2.INTER_NEAREST, borderValue=0)
     empty = cv2.dilate(cv2.bitwise_not(valid), np.ones((5, 5), np.uint8))
     log.info("  空角: 修补 %.2f%% 的面积", 100 * float(np.count_nonzero(empty)) / empty.size)
-    return inpaint(out, empty)
+    keep = cv2.warpAffine(keep, M, size, flags=cv2.INTER_NEAREST, borderValue=0)
+    return inpaint(out, empty, keep), keep
 
 
 # ---------------------------------------------------------------- 主流程
@@ -488,20 +844,26 @@ def process(path: Path, args: argparse.Namespace) -> bool:
     paper = float(np.mean(bg))
     log.debug("  纸张底色 BGR=%s", bg)
 
+    # 0. 大面积浅色彩色噪点（粉色墨粉斑、彩色竖条纹等）：先清掉，免得被后续步骤当成墨迹
+    img = color_noise_clean(img, bg)
+
     # 1. 黑边与边框带：基于原始扫描坐标（扫描仪的边框与图片边缘平行），必须在旋转之前处理
-    border = cv2.bitwise_or(border_dark_mask(img, bg, args.thresh, args.margin), edge_band_mask(img))
+    # 骑缝章先保护起来，后续所有清除步骤都不得改动；掩码只在原图上检测一次，之后随图像一起旋转
+    keep = trim_keep_at_border(stamp_mask(img, bg), img, bg, args.thresh, args.margin)
+    border = cv2.bitwise_or(border_dark_mask(img, bg, args.thresh, args.margin, keep), edge_band_mask(img))
+    border = cv2.bitwise_and(border, cv2.bitwise_not(keep))
     log.info("  黑边: 修补 %.2f%% 的面积", 100 * float(np.count_nonzero(border)) / border.size)
-    out = inpaint(img, border)
+    out = inpaint(img, border, keep)
 
     # 2/3. 方向与倾斜
     confirmed = False
     if args.rotate:
         rot, confirmed = detect_orientation(out)
         if rot:
-            out = rotate_cw(out, rot)
+            out, keep = rotate_cw(out, rot), rotate_cw(keep, rot)
         angle = estimate_skew(out, paper)
         if angle:
-            out = deskew(out, angle, bg)
+            out, keep = deskew(out, angle, bg, keep)
     else:
         log.info("  方向/倾斜: 已关闭")
 
@@ -515,7 +877,7 @@ def process(path: Path, args: argparse.Namespace) -> bool:
             log.warning("  去噪: 方向未确认且文字行不呈横排（行方向比 %.2f < %.2f），为避免误删内容，跳过",
                         ratio, VERTICAL_TEXT)
         else:
-            out = inpaint(out, margin_noise_mask(out, bg, args.noise))
+            out = inpaint(out, margin_noise_mask(out, bg, args.noise), keep)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     dst = OUTPUT_DIR / path.name
