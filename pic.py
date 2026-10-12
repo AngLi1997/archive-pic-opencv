@@ -311,6 +311,31 @@ def trim_keep_at_border(keep: np.ndarray, img: np.ndarray, bg: tuple[int, int, i
     return cv2.bitwise_and(keep, cv2.bitwise_not(band))
 
 
+def charlike_ink(gray: np.ndarray, bg: tuple[int, int, int], region: np.ndarray,
+                 exclude: np.ndarray | None = None, touch_edge: bool = True,
+                 max_size: int | None = None) -> np.ndarray:
+    """region 里“像字”的墨迹块（面积够大、不是细长线条）的保护掩码（外扩 2px）。
+
+    exclude: 这些像素不算墨迹；touch_edge=False 时贴着图片边缘的块不保护（多半是被截断的残迹）；
+    max_size: 外框长边超过它的块（长横线、表格框）不保护。
+    """
+    H, W = gray.shape
+    ink = gray < int(np.mean(bg)) * 0.65
+    if exclude is not None:
+        ink &= exclude == 0
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)
+    protect = np.zeros((H, W), np.uint8)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        line_like = min(w, h) <= 6 and max(w, h) > 8 * min(w, h)
+        at_edge = x == 0 or y == 0 or x + w == W or y + h == H
+        small = max_size is None or max(w, h) <= max_size
+        if area >= 30 and not line_like and small and (touch_edge or not at_edge) \
+                and (region[y:y + h, x:x + w] > 0).any():
+            protect[y:y + h, x:x + w][lab[y:y + h, x:x + w] == i] = 255
+    return cv2.dilate(protect, np.ones((5, 5), np.uint8))
+
+
 def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, margin: int,
                      keep: np.ndarray | None = None) -> np.ndarray:
     """与图片边缘相连的黑色区域（黑边、三角黑角、撕裂的黑块）的掩码。
@@ -335,15 +360,7 @@ def border_dark_mask(img: np.ndarray, bg: tuple[int, int, int], thresh: int, mar
     r = max(margin, int(round(0.022 * min(H, W))))
     grown = cv2.dilate(seed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
     # 但紧挨黑边的手写/印刷字符不能被扩展区吞掉：保护扩展区里“像字”的墨迹块（细长线条不保护）
-    ink = ((gray < int(np.mean(bg)) * 0.65) & (core == 0)).astype(np.uint8)
-    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
-    protect = np.zeros((H, W), np.uint8)
-    for i in range(1, n2):
-        x, y, w, h, area = st2[i]
-        line_like = min(w, h) <= 6 and max(w, h) > 8 * min(w, h)
-        if area >= 30 and not line_like and (grown[y:y + h, x:x + w] > 0).any():
-            protect[y:y + h, x:x + w][lab2[y:y + h, x:x + w] == i] = 255
-    protect = cv2.dilate(protect, np.ones((5, 5), np.uint8))
+    protect = charlike_ink(gray, bg, grown, core)
     return cv2.bitwise_and(cv2.bitwise_or(core, cv2.bitwise_and(grown, cv2.bitwise_not(protect))), free)
 
 
@@ -460,10 +477,12 @@ def color_noise_clean(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: float = NOISE_RATIO) -> np.ndarray:
+def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: float = NOISE_RATIO,
+                      cleaned: np.ndarray | None = None) -> np.ndarray:
     """版心之外的阴影条带与零星噪点的掩码，不含正文。
 
     noise_ratio: 孤立墨点的最大尺寸占典型字高的比例，越大清除得越多。
+    cleaned: 第 1 步清除过的黑边区域（不含边框带，与 img 同坐标），用于判断贴边笔迹是否被黑边截断。
     """
     H, W = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -519,42 +538,145 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
     outside[max(ty0, 0):ty1, max(tx0, 0):tx1] = 0
     kill = np.zeros((H, W), np.uint8)
 
-    # 2. 版心之外的孤立小块墨点：尺寸远小于一个字、接近“团块”形状，并且周围没有其他墨迹
-    #    （细长的手写笔画如“1”不删；周围有一串字符的是正文，哪怕颜色浅、没被划进版心也不动）
+    # 2. 版心之外的孤立小块墨点：尺寸远小于一个字、接近“团块”形状，并且周围没有字、线这样的大墨迹
+    #    （细长的手写笔画如“1”不删；周围有字的是正文，哪怕颜色浅、没被划进版心也不动）
     # 噪点必须明显小于一个字：孤立的整字（如页码“3”、加粗的标题字）不会被误删
     speck = max(6, int(noise_ratio * char_h))
     radius = 0.05 * min(H, W)
     near = int(0.03 * min(H, W))  # 黑边清除后，被截断的笔迹离边缘仍会留有一小段距离
+    # 噪点常带一圈浅灰的晕，深色阈值只抓得到核心：按浅色阈值连通，清除时连晕一起去掉
+    soft = (gray < paper - 40).astype(np.uint8)
+    n3, lab3, st3, cen3 = cv2.connectedComponentsWithStats(soft, connectivity=8)
+    lab3 = np.asarray(lab3, np.int32)
+    # “大墨迹”：比噪点大的深色块，或接近字大小的浅色块（浅色的字被深色阈值拆成碎块，但浅色阈值下仍是整字）。
+    # 只有它们才说明附近是正文；成片的噪点彼此挨着，不能互相证明是文字
+    big2 = np.flatnonzero(np.maximum(st2[1:, 2], st2[1:, 3]) > speck) + 1
+    # 浅色块要是笔画构成的（填充率低）；噪点的晕是实心的一团，哪怕有字那么大也不算
+    big3 = np.flatnonzero((np.maximum(st3[1:, 2], st3[1:, 3]) >= 0.8 * char_h)
+                          & (st3[1:, 4] < 0.45 * st3[1:, 2] * st3[1:, 3])) + 1
+    # 贴边截断的判断：浅色连通域碰到图片边缘，或碰到第 1 步清除过的黑边区域
+    edge_zone = np.zeros((H, W), np.uint8)
+    edge_zone[:3], edge_zone[-3:], edge_zone[:, :3], edge_zone[:, -3:] = 1, 1, 1, 1
+    if cleaned is not None:
+        edge_zone |= (cv2.dilate(cleaned, np.ones((7, 7), np.uint8)) > 0).astype(np.uint8)
+    cut = np.zeros(n3, bool)
+    cut[np.unique(lab3[(edge_zone > 0) & (soft > 0)])] = True
+    cut[0] = False
+
+    # 带颜色的块（印章的碎笔画、彩色墨粉点）只按旧规则判断：成片的印章碎点彼此挨着，不能当孤立噪点
+    lab_img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    paper_lab = cv2.cvtColor(np.uint8([[bg]]), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    chroma = np.hypot(lab_img[..., 1] - paper_lab[1], lab_img[..., 2] - paper_lab[2])
+
+    # 单个小块的色度受 JPEG 噪声影响很大（浅色印章的碎笔画平均色度可能和灰色噪点差不多），
+    # 改看周围一片：附近的浅色墨迹里带颜色的占比高，就是印章、彩色笔迹的一部分
+    k = 2 * speck + 1
+    soft_f = soft.astype(np.float32)
+    tint = cv2.boxFilter(soft_f * (chroma > 2 * COLOR_MIN), -1, (k, k), normalize=False)
+    tint /= np.maximum(cv2.boxFilter(soft_f, -1, (k, k), normalize=False), 1.0)
+    colored3 = np.bincount(lab3.ravel(), weights=tint.ravel(), minlength=n3) / np.maximum(st3[:, 4], 1) > 0.3
+    colored3[0] = False
+
+    def colored(sel: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
+        return bool(colored3[lab3[y:y + h, x:x + w][sel]].any())
+
+    def no_big_near(cx: float, cy: float, own2: int, own3: np.ndarray) -> bool:
+        # 附近没有字、线这样的大墨迹；不算自己，也不算包住自己的浅色晕
+        b2, b3 = big2[big2 != own2], big3[~np.isin(big3, own3)]
+        xy = np.r_[cen2[b2], cen3[b3]]
+        return not (np.hypot(xy[:, 0] - cx, xy[:, 1] - cy) < radius).any()
+
+    blob = np.zeros((H, W), np.uint8)  # 较大的墨团，外面还会再清一圈淡晕
+
+    def erase(sel: np.ndarray, x: int, y: int, w: int, h: int, halo: bool) -> None:
+        # halo: 连同包住它的浅色晕一起清。晕若大得像一片字（浅色正文压着墨点）、或带颜色（印章笔画、彩色墨粉团），
+        # 或者深色核心只有一两个像素（多是浅色印章、浅色图形里的深色像素），只清深色部分
+        kill[y:y + h, x:x + w][sel] = 255
+        if not halo or int(sel.sum()) < 4:
+            return
+        for j in np.unique(lab3[y:y + h, x:x + w][sel]):
+            if j and max(st3[j, 2], st3[j, 3]) <= 3 * speck and not colored3[j]:
+                jx, jy, jw, jh = st3[j, :4]
+                comp = lab3[jy:jy + jh, jx:jx + jw] == j
+                kill[jy:jy + jh, jx:jx + jw][comp] = 255
+                if max(jw, jh) >= max(4, 0.15 * char_h):
+                    blob[jy:jy + jh, jx:jx + jw][comp] = 255
+
     n_edge = n_speck = 0
+    seen = np.zeros(n3, bool)  # 含深色核心的浅色连通域，由核心来判
+    seen[np.unique(lab3[ink > 0])] = True
     for i in range(1, n2):
-        w, h = st2[i, 2], st2[i, 3]
+        x, y, w, h, area = st2[i]
         cx, cy = cen2[i]
         if not outside[int(min(cy, H - 1)), int(min(cx, W - 1))]:
             continue
-        x, y = st2[i, 0], st2[i, 1]
-        # 版心之外、紧贴（或被截断于）图片边缘的笔迹：多半是相邻页透过来的字或扫描残留，直接去掉
+        sel = lab2[y:y + h, x:x + w] == i
+        solid = area >= 0.45 * w * h
+        # 版心之外、紧贴（或被截断于）图片边缘的笔迹：多半是相邻页透过来的字或扫描残留，直接去掉。
+        # 但没被截断、字大小、笔画构成的块是页边完整的手写字（如页码、档案编号“4”），保留
         if x <= near or y <= near or x + w >= W - near or y + h >= H - near:
-            kill[lab2 == i] = 255
-            n_edge += 1
-            log.debug("    清除贴边笔迹 (%d,%d) %dx%d", x, y, w, h)
+            truncated = bool(cut[lab3[y:y + h, x:x + w][sel]].any())
+            if truncated or max(w, h) < 0.6 * char_h or solid:
+                erase(sel, x, y, w, h, halo=False)
+                n_edge += 1
+                log.debug("    清除贴边笔迹 (%d,%d) %dx%d", x, y, w, h)
+            else:
+                log.debug("    保留页边手写字 (%d,%d) %dx%d", x, y, w, h)
             continue
         # 接近字大小的块只有“实心墨团”才算噪点（笔画构成的字填充率低）
-        solid = st2[i, 4] >= 0.45 * w * h
         if max(w, h) > (2 * speck if solid else speck) or max(w, h) > 3 * min(w, h):
             continue
-        dist = np.hypot(cen2[1:, 0] - cx, cen2[1:, 1] - cy)
-        if int((dist < radius).sum()) - 1 > 2:  # 减去自己；邻居多说明是文字
+        # 周围墨迹块不超过两个（旧规则），或者附近只有噪点、没有大墨迹（灰色的成片噪点）
+        few = int((np.hypot(cen2[1:, 0] - cx, cen2[1:, 1] - cy) < radius).sum()) - 1 <= 2
+        if not few and (colored(sel, x, y, w, h) or not no_big_near(cx, cy, i, np.unique(lab3[y:y + h, x:x + w][sel]))):
             continue
-        kill[lab2 == i] = 255
+        erase(sel, x, y, w, h, halo=True)
         n_speck += 1
         log.debug("    清除孤立墨点 (%d,%d) %dx%d", x, y, w, h)
 
-    log.info("  去噪: 清除贴边笔迹 %d 处、孤立墨点 %d 处（墨点尺寸上限 %dpx = 字高 %.0fpx × %.2f）",
-             n_edge, n_speck, speck, char_h, noise_ratio)
-    return cv2.dilate(kill, np.ones((7, 7), np.uint8))
+    # 没有深色核心的浅灰噪点：同样要求小、成团、附近没有大墨迹。
+    # 带颜色的（印章碎笔画）不管；页边一圈也不管（装订孔、浅色的骑缝残迹常在那里，只露出零碎的浅色笔画）
+    n_faint = 0
+    for j in np.flatnonzero(~seen[1:]) + 1:
+        x, y, w, h, area = st3[j]
+        cx, cy = cen3[j]
+        if not outside[int(min(cy, H - 1)), int(min(cx, W - 1))] or area < 10:
+            continue
+        if x <= near or y <= near or x + w >= W - near or y + h >= H - near:
+            continue
+        sel = lab3[y:y + h, x:x + w] == j
+        if max(w, h) > speck or max(w, h) > 3 * min(w, h) or colored3[j] or not no_big_near(cx, cy, 0, np.array([j])):
+            continue
+        # 紧挨着还有没清掉的浅色笔画，说明它是某个浅色图形（装订孔轮廓、浅色字）的一部分
+        g = 2 * speck
+        wx0, wy0, wx1, wy1 = max(0, x - g), max(0, y - g), min(W, x + w + g), min(H, y + h + g)
+        others = lab3[wy0:wy1, wx0:wx1][(soft[wy0:wy1, wx0:wx1] > 0) & (kill[wy0:wy1, wx0:wx1] == 0)]
+        others = others[others != j]
+        if (st3[others, 4] >= 10).any():
+            continue
+        kill[y:y + h, x:x + w][sel] = 255
+        n_faint += 1
+        log.debug("    清除浅色墨点 (%d,%d) %dx%d", x, y, w, h)
+
+    log.info("  去噪: 清除贴边笔迹 %d 处、孤立墨点 %d 处、浅色墨点 %d 处（墨点尺寸上限 %dpx = 字高 %.0fpx × %.2f）",
+             n_edge, n_speck, n_faint, speck, char_h, noise_ratio)
+    kill = cv2.dilate(kill, np.ones((7, 7), np.uint8))
+    # 大一点的墨团外面还有一圈更淡的晕，只清到浅色阈值会留下一个灰影：连着它的淡色小块一并清掉
+    # （一两个像素的小点不扩，它们常是浅色印章、浅色字里的深色像素）
+    if blob.any():
+        halo = (gray < paper - 20).astype(np.uint8)
+        n4, lab4, st4, _ = cv2.connectedComponentsWithStats(halo, connectivity=8)
+        hit = np.zeros(n4, bool)
+        hit[np.unique(lab4[(blob > 0) & (halo > 0)])] = True
+        hit[0] = False
+        hit &= np.maximum(st4[:, 2], st4[:, 3]) <= 4 * speck
+        # 晕连着的若是带颜色的块（彩色墨粉团、印章碎笔画），不扩过去
+        hit &= ~(np.bincount(lab4.ravel(), weights=tint.ravel(), minlength=n4) / np.maximum(st4[:, 4], 1) > 0.3)
+        kill |= cv2.dilate(hit[lab4].astype(np.uint8) * 255, np.ones((5, 5), np.uint8))
+    return kill
 
 
-def edge_band_mask(img: np.ndarray) -> np.ndarray:
+def edge_band_mask(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
     """扫描仪在页边留下的“边框带”（过曝白带、细暗线、亮度台阶）的掩码。
 
     四条边各取中间 60% 长度的逐行/列中位数，从边缘向内找出与纸张底色持续存在差异的区间，
@@ -584,7 +706,11 @@ def edge_band_mask(img: np.ndarray) -> np.ndarray:
     left = band(np.median(gray[mid_r, :lim_w * 2 + 1], axis=0), lim_w)
     right = band(np.median(gray[mid_r, -lim_w * 2 - 1:], axis=0)[::-1], lim_w)
     mask[:top], mask[H - bottom:], mask[:, :left], mask[:, W - right:] = 255, 255, 255, 255
-    return cv2.dilate(mask, np.ones((5, 5), np.uint8))
+    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
+    # 边框带常是扫描的亮度渐变，可能有几十像素宽，压在页边的手写字（如档案编号）不能一起抹掉；
+    # 细暗线、长横线、贴边被截断的残迹不保护
+    protect = charlike_ink(gray, bg, mask, touch_edge=False, max_size=int(0.08 * min(H, W)))
+    return cv2.bitwise_and(mask, cv2.bitwise_not(protect))
 
 
 def inpaint(img: np.ndarray, mask: np.ndarray, keep: np.ndarray | None = None) -> np.ndarray:
@@ -797,9 +923,10 @@ def content_mask(img: np.ndarray, paper: float) -> np.ndarray:
     return cv2.medianBlur(m, 3)  # 去掉 JPEG 噪声造成的单个像素
 
 
-def deskew(img: np.ndarray, angle: float, bg: tuple[int, int, int],
-           keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """按 angle（逆时针为正）旋转校正，空角用周围纸张纹理修补。返回 (校正后的图, 同样变换后的印章保护掩码)。
+def deskew(img: np.ndarray, angle: float, bg: tuple[int, int, int], keep: np.ndarray,
+           cleaned: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """按 angle（逆时针为正）旋转校正，空角用周围纸张纹理修补。
+    返回 (校正后的图, 同样变换后的印章保护掩码, 同样变换后的已清除黑边区域)。
 
     默认保持原尺寸；若这样会把任何内容像素转出画布，则扩展画布以完整保留内容。
     骑缝章本来就被图片边缘截断，再转出去几个像素不算丢内容，不为它扩展画布。
@@ -825,7 +952,9 @@ def deskew(img: np.ndarray, angle: float, bg: tuple[int, int, int],
     empty = cv2.dilate(cv2.bitwise_not(valid), np.ones((5, 5), np.uint8))
     log.info("  空角: 修补 %.2f%% 的面积", 100 * float(np.count_nonzero(empty)) / empty.size)
     keep = cv2.warpAffine(keep, M, size, flags=cv2.INTER_NEAREST, borderValue=0)
-    return inpaint(out, empty, keep), keep
+    # 空角也算清除过的边缘区域：贴着它的笔迹同样是被截断的
+    cleaned = cv2.warpAffine(cleaned, M, size, flags=cv2.INTER_NEAREST, borderValue=255)
+    return inpaint(out, empty, keep), keep, cleaned
 
 
 # ---------------------------------------------------------------- 主流程
@@ -850,20 +979,22 @@ def process(path: Path, args: argparse.Namespace) -> bool:
     # 1. 黑边与边框带：基于原始扫描坐标（扫描仪的边框与图片边缘平行），必须在旋转之前处理
     # 骑缝章先保护起来，后续所有清除步骤都不得改动；掩码只在原图上检测一次，之后随图像一起旋转
     keep = trim_keep_at_border(stamp_mask(img, bg), img, bg, args.thresh, args.margin)
-    border = cv2.bitwise_or(border_dark_mask(img, bg, args.thresh, args.margin, keep), edge_band_mask(img))
-    border = cv2.bitwise_and(border, cv2.bitwise_not(keep))
+    dark = cv2.bitwise_and(border_dark_mask(img, bg, args.thresh, args.margin, keep), cv2.bitwise_not(keep))
+    border = cv2.bitwise_and(cv2.bitwise_or(dark, edge_band_mask(img, bg)), cv2.bitwise_not(keep))
     log.info("  黑边: 修补 %.2f%% 的面积", 100 * float(np.count_nonzero(border)) / border.size)
     out = inpaint(img, border, keep)
+    # 黑边会截断页边的笔迹，第 4 步据此判断贴边笔迹是不是残迹（边框带只是亮度渐变，不截断笔迹）
+    cleaned = dark
 
     # 2/3. 方向与倾斜
     confirmed = False
     if args.rotate:
         rot, confirmed = detect_orientation(out)
         if rot:
-            out, keep = rotate_cw(out, rot), rotate_cw(keep, rot)
+            out, keep, cleaned = rotate_cw(out, rot), rotate_cw(keep, rot), rotate_cw(cleaned, rot)
         angle = estimate_skew(out, paper)
         if angle:
-            out, keep = deskew(out, angle, bg, keep)
+            out, keep, cleaned = deskew(out, angle, bg, keep, cleaned)
     else:
         log.info("  方向/倾斜: 已关闭")
 
@@ -877,7 +1008,7 @@ def process(path: Path, args: argparse.Namespace) -> bool:
             log.warning("  去噪: 方向未确认且文字行不呈横排（行方向比 %.2f < %.2f），为避免误删内容，跳过",
                         ratio, VERTICAL_TEXT)
         else:
-            out = inpaint(out, margin_noise_mask(out, bg, args.noise), keep)
+            out = inpaint(out, margin_noise_mask(out, bg, args.noise, cleaned), keep)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     dst = OUTPUT_DIR / path.name
