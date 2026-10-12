@@ -144,12 +144,28 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
     for i in big:
         ys, xs = np.nonzero((lab == i) & (ink > 0))
         if ys.size and min(np.ptp(xs), np.ptp(ys)) + 1 > H * 0.008:
-            boxes.append((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+            boxes.append((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1, ink_cnt[i - 1]))
     if not boxes:
         log.info("  去噪: 未找到正文行，无法确定版心，跳过")
         return np.zeros((H, W), np.uint8)
-    x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
-    x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+    # 墨迹少、外框又只有一两个字大的块（页角的墨团、污渍也可能这么大）不能单独撑大版心：
+    # 先用其余的行定出版心，小块只有离版心足够近时才并入
+    def minor(b: tuple) -> bool:
+        return b[4] < 2 * char_h * char_h and max(b[2] - b[0], b[3] - b[1]) < 4 * char_h
+    major = [b for b in boxes if not minor(b)] or boxes
+    x0, y0 = min(b[0] for b in major), min(b[1] for b in major)
+    x1, y1 = max(b[2] for b in major), max(b[3] for b in major)
+    rest, gap = [b for b in boxes if b not in major], 2 * char_h
+    grew = True
+    while grew:
+        grew = False
+        for b in rest[:]:
+            if b[0] - x1 <= gap and x0 - b[2] <= gap and b[1] - y1 <= gap and y0 - b[3] <= gap:
+                x0, y0, x1, y1 = min(x0, b[0]), min(y0, b[1]), max(x1, b[2]), max(y1, b[3])
+                rest.remove(b)
+                grew = True
+    for b in rest:
+        log.debug("    小块 (%d,%d)-(%d,%d) 远离正文，不计入版心", *b[:4])
     pad_x, pad_y = int(W * 0.02), int(H * 0.015)
     tx0, ty0, tx1, ty1 = x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y
     log.debug("  去噪: 典型字高 %.0fpx，版心 (%d,%d)-(%d,%d)", char_h, max(tx0, 0), max(ty0, 0),
