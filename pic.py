@@ -494,10 +494,17 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
     hs = hs[hs > max(10, H // 350)]
     char_h = float(np.percentile(hs, 75)) if hs.size else 0.015 * H
 
-    # 1. 把字符横向合并成行，用墨迹量足够大的连通域确定版心
+    # 噪点必须明显小于一个字：孤立的整字（如页码“3”、加粗的标题字）不会被误删
+    speck = max(6, int(noise_ratio * char_h))
+
+    # 1. 把字符横向合并成行，用墨迹量足够大的连通域确定版心。
+    #    墨点不参与：页边成串的墨点离表格框、正文不远时会被横向膨胀并进去，把版心撑到页边
+    dot = np.maximum(st2[:, 2], st2[:, 3]) <= speck
+    dot[0] = False
+    body = ink & ~dot[np.asarray(lab2, np.int32)]
     merge = cv2.getStructuringElement(cv2.MORPH_RECT, (max(W // 25, 3), max(H // 200, 3)))
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(ink, merge), connectivity=8)
-    ink_cnt = np.bincount(lab.ravel().astype(np.int32, copy=False), weights=ink.ravel(), minlength=n)[1:]
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(body, merge), connectivity=8)
+    ink_cnt = np.bincount(lab.ravel().astype(np.int32, copy=False), weights=body.ravel(), minlength=n)[1:]
     if ink_cnt.size == 0 or ink_cnt.max() == 0:
         log.info("  去噪: 未发现墨迹，跳过")
         return np.zeros((H, W), np.uint8)
@@ -505,7 +512,7 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
     big = np.flatnonzero(ink_cnt >= 0.3 * char_h * char_h) + 1
     boxes = []  # 用墨迹本身的外框（而非膨胀后的）判断，避免细黑线因膨胀被当成正文
     for i in big:
-        ys, xs = np.nonzero((lab == i) & (ink > 0))
+        ys, xs = np.nonzero((lab == i) & (body > 0))
         if ys.size and min(np.ptp(xs), np.ptp(ys)) + 1 > H * 0.008:
             boxes.append((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1, ink_cnt[i - 1]))
     if not boxes:
@@ -540,8 +547,6 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
 
     # 2. 版心之外的孤立小块墨点：尺寸远小于一个字、接近“团块”形状，并且周围没有字、线这样的大墨迹
     #    （细长的手写笔画如“1”不删；周围有字的是正文，哪怕颜色浅、没被划进版心也不动）
-    # 噪点必须明显小于一个字：孤立的整字（如页码“3”、加粗的标题字）不会被误删
-    speck = max(6, int(noise_ratio * char_h))
     radius = 0.05 * min(H, W)
     near = int(0.03 * min(H, W))  # 黑边清除后，被截断的笔迹离边缘仍会留有一小段距离
     # 噪点常带一圈浅灰的晕，深色阈值只抓得到核心：按浅色阈值连通，清除时连晕一起去掉
@@ -580,11 +585,24 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
     def colored(sel: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
         return bool(colored3[lab3[y:y + h, x:x + w][sel]].any())
 
+    def out_c(c: np.ndarray) -> np.ndarray:  # 中心落在版心之外
+        return outside[np.minimum(c[:, 1], H - 1).astype(int), np.minimum(c[:, 0], W - 1).astype(int)] > 0
+
+    # 版心里的字离版心外的墨点至少隔着版心的留白，不能说明墨点是正文（如表格框内紧挨边框的字）；
+    # 只看同在版心外的大墨迹（页边的手写字、浅色的字行）
+    big2o, big3o = big2[out_c(cen2[big2])], big3[out_c(cen3[big3])]
+
     def no_big_near(cx: float, cy: float, own2: int, own3: np.ndarray) -> bool:
         # 附近没有字、线这样的大墨迹；不算自己，也不算包住自己的浅色晕
-        b2, b3 = big2[big2 != own2], big3[~np.isin(big3, own3)]
+        b2, b3 = big2o[big2o != own2], big3o[~np.isin(big3o, own3)]
         xy = np.r_[cen2[b2], cen3[b3]]
         return not (np.hypot(xy[:, 0] - cx, xy[:, 1] - cy) < radius).any()
+
+    # 浅色阈值下的“团块”：填充率高、没被图片边缘截断、不比墨点大多少。
+    # 装订孔轮廓、浅色骑缝残迹、浅色的字是细线笔画，填充率低
+    def lump(j: int | np.integer) -> bool:
+        return bool(st3[j, 4] >= 0.3 * st3[j, 2] * st3[j, 3]) and not cut[j] \
+            and max(st3[j, 2], st3[j, 3]) <= 1.2 * speck
 
     # 笔画构成的字（字大小、填充率低，不含长线、表格框、实心墨团）：紧挨着它、落在同一行中段的
     # 短横或小点是标点（如页码“- 2 -”两侧的短横）
@@ -605,13 +623,17 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
 
     blob = np.zeros((H, W), np.uint8)  # 较大的墨团，外面还会再清一圈淡晕
 
-    def erase(sel: np.ndarray, x: int, y: int, w: int, h: int, halo: bool) -> None:
+    def erase(sel: np.ndarray, x: int, y: int, w: int, h: int, halo: bool, lump_only: bool = False) -> None:
         # halo: 连同包住它的浅色晕一起清。晕若大得像一片字（浅色正文压着墨点）、或带颜色（印章笔画、彩色墨粉团），
-        # 或者深色核心只有一两个像素（多是浅色印章、浅色图形里的深色像素），只清深色部分
+        # 或者深色核心只有一两个像素（多是浅色印章、浅色图形里的深色像素），只清深色部分；
+        # 但晕本身是个小团块时，核心再小也是墨点。lump_only: 只清团块状的晕（页边手写字的碎笔画，
+        # 其浅色连通域是整个字，不能连带清掉）
         kill[y:y + h, x:x + w][sel] = 255
-        if not halo or int(sel.sum()) < 4:
+        if not halo:
             return
         for j in np.unique(lab3[y:y + h, x:x + w][sel]):
+            if (int(sel.sum()) < 4 or lump_only) and not lump(j):
+                continue
             if j and max(st3[j, 2], st3[j, 3]) <= 3 * speck and not colored3[j]:
                 jx, jy, jw, jh = st3[j, :4]
                 comp = lab3[jy:jy + jh, jx:jx + jw] == j
@@ -630,11 +652,12 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
         sel = lab2[y:y + h, x:x + w] == i
         solid = area >= 0.45 * w * h
         # 版心之外、紧贴（或被截断于）图片边缘的笔迹：多半是相邻页透过来的字或扫描残留，直接去掉。
-        # 但没被截断、字大小、笔画构成的块是页边完整的手写字（如页码、档案编号“4”），保留
+        # 但没被截断、字大小、笔画构成的块是页边完整的手写字（如页码、档案编号“4”），保留。
+        # 没被截断的小块是页边的墨点，常常只有一小撮深色核心、外面是一大团灰晕，连晕一起清
         if x <= near or y <= near or x + w >= W - near or y + h >= H - near:
             truncated = bool(cut[lab3[y:y + h, x:x + w][sel]].any())
             if truncated or max(w, h) < 0.6 * char_h or solid:
-                erase(sel, x, y, w, h, halo=False)
+                erase(sel, x, y, w, h, halo=not truncated, lump_only=True)
                 n_edge += 1
                 log.debug("    清除贴边笔迹 (%d,%d) %dx%d", x, y, w, h)
             else:
@@ -654,32 +677,66 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
         n_speck += 1
         log.debug("    清除孤立墨点 (%d,%d) %dx%d", x, y, w, h)
 
-    # 没有深色核心的浅灰噪点：同样要求小、成团、附近没有大墨迹。
-    # 带颜色的（印章碎笔画）不管；页边一圈也不管（装订孔、浅色的骑缝残迹常在那里，只露出零碎的浅色笔画）
+    # 没有深色核心的浅灰噪点：同样要求小、成团、附近没有大墨迹。带颜色的（印章碎笔画）不管。
+    # 页边一圈只清团块：装订孔、浅色的骑缝残迹常在那里，只露出零碎的浅色笔画
     n_faint = 0
     for j in np.flatnonzero(~seen[1:]) + 1:
         x, y, w, h, area = st3[j]
         cx, cy = cen3[j]
         if not outside[int(min(cy, H - 1)), int(min(cx, W - 1))] or area < 10:
             continue
-        if x <= near or y <= near or x + w >= W - near or y + h >= H - near:
+        at_edge = x <= near or y <= near or x + w >= W - near or y + h >= H - near
+        if at_edge and not lump(j):
             continue
         sel = lab3[y:y + h, x:x + w] == j
-        if max(w, h) > speck or max(w, h) > 3 * min(w, h) or colored3[j] or not no_big_near(cx, cy, 0, np.array([j])):
+        # 团块的浅色阈值连通域比深色核心大一圈，尺寸上限放宽一些
+        lim = 1.2 * speck if lump(j) else speck
+        if max(w, h) > lim or max(w, h) > 3 * min(w, h) or colored3[j] or not no_big_near(cx, cy, 0, np.array([j])):
             continue
-        # 紧挨着还有没清掉的浅色笔画，说明它是某个浅色图形（装订孔轮廓、浅色字）的一部分
+        # 紧挨着还有没清掉的浅色笔画，说明它是某个浅色图形（装订孔轮廓、浅色字）的一部分；
+        # 成片的小团块彼此挨着不算
         g = 2 * speck
         wx0, wy0, wx1, wy1 = max(0, x - g), max(0, y - g), min(W, x + w + g), min(H, y + h + g)
         others = lab3[wy0:wy1, wx0:wx1][(soft[wy0:wy1, wx0:wx1] > 0) & (kill[wy0:wy1, wx0:wx1] == 0)]
-        others = others[others != j]
-        if (st3[others, 4] >= 10).any():
+        others = np.unique(others[others != j])
+        if any(st3[o, 4] >= 10 and not lump(o) for o in others):
             continue
         kill[y:y + h, x:x + w][sel] = 255
         n_faint += 1
         log.debug("    清除浅色墨点 (%d,%d) %dx%d", x, y, w, h)
 
-    log.info("  去噪: 清除贴边笔迹 %d 处、孤立墨点 %d 处、浅色墨点 %d 处（墨点尺寸上限 %dpx = 字高 %.0fpx × %.2f）",
-             n_edge, n_speck, n_faint, speck, char_h, noise_ratio)
+    # 页边的直线角标、裁切线残段（多是扫描仪留下的灰色细线）：浅色阈值下整块几乎全由横、竖直线构成，
+    # 而且是一横一竖拐角相接的角标。单独的竖线可能是手写的“1”或装订孔方框断开的一边，
+    # 三面、四面都有边的是装订孔的方框，都不动
+    L = max(8, int(0.3 * char_h))
+    hl = cv2.morphologyEx(soft, cv2.MORPH_OPEN, np.ones((1, L), np.uint8))
+    vl = cv2.morphologyEx(soft, cv2.MORPH_OPEN, np.ones((L, 1), np.uint8))
+    n_line = 0
+    for j in range(1, n3):
+        x, y, w, h, area = st3[j]
+        cx, cy = cen3[j]
+        if not outside[int(min(cy, H - 1)), int(min(cx, W - 1))] or max(w, h) < L or max(w, h) > 4 * char_h:
+            continue
+        if not (x <= near or y <= near or x + w >= W - near or y + h >= H - near) or colored3[j]:
+            continue
+        sel = lab3[y:y + h, x:x + w] == j
+        nh, nv = int(hl[y:y + h, x:x + w][sel].sum()), int(vl[y:y + h, x:x + w][sel].sum())
+        if (nh + nv) < 0.6 * area:
+            continue
+        # 外框四条边上各有多少墨迹：被线覆盖过半的算一条边
+        c = sel.astype(np.uint8)
+        t = 3
+        sides = [c[:t].any(0).mean(), c[-t:].any(0).mean(), c[:, :t].any(1).mean(), c[:, -t:].any(1).mean()]
+        n_sides = sum(v > 0.5 for v in sides)
+        corner = nh >= L and nv >= L and n_sides == 2 and min(w, h) >= L / 2
+        if not corner:
+            continue
+        kill[y:y + h, x:x + w][sel] = 255
+        n_line += 1
+        log.debug("    清除页边直线角标 (%d,%d) %dx%d", x, y, w, h)
+
+    log.info("  去噪: 清除贴边笔迹 %d 处、孤立墨点 %d 处、浅色墨点 %d 处、直线角标 %d 处（墨点尺寸上限 %dpx = 字高 %.0fpx × %.2f）",
+             n_edge, n_speck, n_faint, n_line, speck, char_h, noise_ratio)
     kill = cv2.dilate(kill, np.ones((7, 7), np.uint8))
     # 大一点的墨团外面还有一圈更淡的晕，只清到浅色阈值会留下一个灰影：连着它的淡色小块一并清掉
     # （一两个像素的小点不扩，它们常是浅色印章、浅色字里的深色像素）
@@ -693,6 +750,35 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
         # 晕连着的若是带颜色的块（彩色墨粉团、印章碎笔画），不扩过去
         hit &= ~(np.bincount(lab4.ravel(), weights=tint.ravel(), minlength=n4) / np.maximum(st4[:, 4], 1) > 0.3)
         kill |= cv2.dilate(hit[lab4].astype(np.uint8) * 255, np.ones((5, 5), np.uint8))
+
+    # 页边的淡色痕迹：背面透过来的字、纸张折角和折痕的阴影。它们只比纸色暗几个灰度，上面的阈值都抓不到。
+    # 按局部纸色（大窗口中值，不受扫描明暗不均影响）找出略暗的区域（滞后阈值：明显偏暗的连着的稍暗部分），
+    # 只在远离正文行、附近也没有真正墨迹（页边的手写字和它的淡晕）、不带颜色（浅色印章）的地方清除
+    text = np.zeros((H, W), np.uint8)
+    for b in boxes:
+        if b not in rest:
+            text[max(b[1] - pad_y, 0):b[3] + pad_y, max(b[0] - pad_x, 0):b[2] + pad_x] = 1
+    sg = cv2.resize(gray, (max(1, W // 8), max(1, H // 8)), interpolation=cv2.INTER_AREA)
+    local = cv2.resize(cv2.medianBlur(sg, 31), (W, H), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    diff = local - cv2.GaussianBlur(gray, (0, 0), 1.5).astype(np.float32)
+    # 只在版心外、以及页边一条（折角常从页角斜着伸进版心的外框）里清，正文行之间的淡色不管
+    rim = np.zeros((H, W), np.uint8)
+    e = int(0.1 * min(H, W))
+    rim[:e], rim[-e:], rim[:, :e], rim[:, -e:] = 1, 1, 1, 1
+    weak = ((diff > 3.5) & (text == 0) & ((outside > 0) | (rim > 0))).astype(np.uint8)
+    n5, lab5 = cv2.connectedComponents(weak, connectivity=8)
+    hit = np.zeros(n5, bool)
+    hit[np.unique(lab5[(diff > 7) & (weak > 0)])] = True
+    hit[0] = False
+    # 真正的墨迹：深色像素，以及不比墨点小的浅色笔画（装订孔方框、浅色手写字）；没清掉的零碎浅色小点不算
+    real = ((gray < paper - 50) | (np.maximum(st3[:, 2], st3[:, 3]) >= speck)[lab3] & (soft > 0)) & (kill == 0)
+    real = real.astype(np.uint8)
+    r = max(3, int(0.5 * char_h))
+    guard = cv2.dilate(real, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+    guard = cv2.bitwise_or(guard, cv2.dilate((chroma > 2 * COLOR_MIN).astype(np.uint8), np.ones((9, 9), np.uint8)))
+    wash = hit[lab5] & (guard == 0)
+    log.info("  去噪: 清除页边淡色痕迹 %.2f%% 的面积", 100 * float(wash.mean()))
+    kill = cv2.bitwise_or(kill, cv2.dilate(wash.astype(np.uint8) * 255, np.ones((3, 3), np.uint8)))
     return kill
 
 
