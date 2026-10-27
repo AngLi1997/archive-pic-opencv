@@ -1,17 +1,19 @@
-"""扫描件清理：去彩色噪点、去黑边、方向检测与旋转校正、去页边噪点。
+"""扫描件清理：去彩色噪点、去黑边、方向检测与旋转校正、淡字加深、去页边噪点。
 
 处理顺序：
   0. 去除大面积浅色彩色噪点（粉色墨粉斑、彩色竖条纹等，颜色不写死，保留印章、红头）
   1. 去除贴边黑边、黑角与页边“边框带”（按原始扫描坐标处理）
   2. 方向检测（0/90/180/270°，Tesseract OSD），把文字转到朝上
   3. 小角度倾斜校正，旋转后露出的空角用周围纸张纹理修补
-  4. 去除版心之外的零星噪点
+  4. 正文淡字加深（只加深成行的文字笔画，不加深噪点、污渍、阴影；本来就清楚的字不动），
+     很淡的字再做细笔画插值，把扫成一串断点的笔画连成连续的线
+  5. 去除版心之外的零星噪点（正文行的笔画不动）
 
 “宁可不转，也不错转”：方向需在四个旋转副本上检测一致、且与文字行方向不矛盾才旋转；
 倾斜角需峰值明显、两种分辨率下结果一致才校正；校正若会把内容转出画布，则改为扩展画布。
 不旋转、不倾斜校正时输出尺寸与原图一致。
 
-用法: python pic.py "图片路径或目录" [-t 阈值] [-m 扩展像素] [--no-rotate] [--no-denoise] [-n 噪点阈值] [-v]
+用法: python pic.py "图片路径或目录" [-t 阈值] [-m 扩展像素] [--no-rotate] [--no-enhance] [--no-interp] [--no-denoise] [-n 噪点阈值] [-v]
 结果保存到 ./output 目录，文件名与原图相同。
 """
 import argparse
@@ -21,6 +23,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -38,6 +41,8 @@ COLOR_STRONG = 45.0
 COLOR_HUE_TOL = 35.0
 # 印章保护：色度高于该值的像素连成有厚度的块即视为印章（骑缝章颜色较浅，阈值低于 COLOR_STRONG）
 STAMP_CHROMA = 25.0
+# 大片浅色彩色区域里，文字笔画（成行、边缘锐利）占带色像素的比例不低于它，就是浅色的彩色字（如淡红头），不清除
+COLOR_TEXT_FRAC = 0.4
 # 骑缝章外圈检测：半径占图片短边的范围（A4 上 38~45mm 的公章约 0.09~0.11）、
 # 图内可见圆弧的最小角度、可见圆弧上有墨迹的最低比例
 STAMP_R_MIN = 0.05
@@ -61,6 +66,30 @@ SKEW_MIN = 0.2
 SKEW_MIN_GAIN = 1.1
 SKEW_MIN_PEAK = 1.3
 SKEW_AGREE = 0.3
+
+# 文字增强：黑帽核直径占短边的比例（比笔画宽、比阴影窄）；笔画暗度的最低门槛；
+# 找行用的边缘梯度门槛与边缘密度门槛；
+# 正文行的最低边缘锐度（梯度 90 分位）与最低笔画暗度（95 分位）；加深后的目标墨色灰度
+ENHANCE_STROKE = 0.0125
+ENHANCE_MIN_DARK = 3.0
+ENHANCE_EDGE = 15.0
+ENHANCE_EDGE_DENSITY = 0.03
+ENHANCE_SHARP = 35.0
+ENHANCE_LINE_DARK = 20.0
+ENHANCE_INK = 30.0
+ENHANCE_FULL = 30.0  # 笔画暗度（黑帽值）达到它即加深到目标墨色
+# 附近笔画暗度（黑帽值）低于 ENHANCE_FAINT 的是淡字，完全加深；高于 ENHANCE_CLEAR 的字本来就清楚，不动
+ENHANCE_FAINT = 70.0
+ENHANCE_CLEAR = 140.0
+ENHANCE_BASE_TOL = 12.0  # 局部底色比纸色暗超过它（阴影、色块）就不加深
+# 细笔画插值：高斯插值的 sigma（像素，按 2480px 短边换算）；插值后暗度占附近最强笔画的比例，
+# 从 LOW 起开始算笔画，到 LOW + RANGE 加到全黑
+ENHANCE_INTERP_SIGMA = 1.3
+ENHANCE_INTERP_LOW = 0.12
+ENHANCE_INTERP_RANGE = 0.3
+# 附近笔画暗度（黑帽值）低于 FAINT 才完全插值，高于 CLEAR 不插值
+ENHANCE_INTERP_FAINT = 45.0
+ENHANCE_INTERP_CLEAR = 80.0
 
 
 def imread(path: Path) -> np.ndarray | None:
@@ -396,6 +425,9 @@ def color_noise_clean(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
     size = (max(1, int(W * s)), max(1, int(H * s)))
     small = cv2.resize(cand.astype(np.float32), size, interpolation=cv2.INTER_AREA)
     strong_s = cv2.resize(strong.astype(np.float32), size, interpolation=cv2.INTER_AREA)
+    # 浅色的彩色字（墨粉不足的红头、浅红标题）也是“大片浅色”，但它是成行的、边缘锐利的笔画
+    text = find_text(img, bg).text & (cand > 0)
+    text_s = cv2.resize(text.astype(np.float32), size, interpolation=cv2.INTER_AREA)
     k = max(3, int(0.02 * min(small.shape)) | 1)
     dens = cv2.blur(small, (k, k))
     region = (dens > 0.08).astype(np.uint8)
@@ -422,9 +454,13 @@ def color_noise_clean(img: np.ndarray, bg: tuple[int, int, int]) -> np.ndarray:
         # 彩色照片、大面积彩色印刷也是“大片彩色”，但其中浓色像素多；噪点几乎全是浅淡的颜色
         sel = lab_r == i
         rich = float(strong_s[sel].sum()) / max(float(small[sel].sum() + strong_s[sel].sum()), 1e-6)
-        if wide and rich < 0.1:
+        # 区域里的浅色彩色像素多半是文字笔画：是一片浅色的字，不是噪点
+        lettered = float(text_s[sel].sum()) / max(float(small[sel].sum()), 1e-6)
+        if wide and rich < 0.1 and lettered >= COLOR_TEXT_FRAC:
+            log.debug("    彩色区域 (%d,%d) %dx%d 多为文字笔画（%.2f），视为浅色文字保留（缩小图）", x, y, w, h, lettered)
+        elif wide and rich < 0.1:
             noise[sel] = 255
-            log.debug("    彩色噪点区域 (%d,%d) %dx%d，浓色占比 %.2f（缩小图）", x, y, w, h, rich)
+            log.debug("    彩色噪点区域 (%d,%d) %dx%d，浓色占比 %.2f，文字笔画占比 %.2f（缩小图）", x, y, w, h, rich, lettered)
         elif wide:
             log.debug("    彩色区域 (%d,%d) %dx%d 浓色占比 %.2f，视为彩色内容保留（缩小图）", x, y, w, h, rich)
     if not noise.any():
@@ -853,6 +889,212 @@ def inpaint(img: np.ndarray, mask: np.ndarray, keep: np.ndarray | None = None) -
     return np.clip(img * (1 - alpha) + fixed * alpha, 0, 255).astype(np.uint8)
 
 
+# ---------------------------------------------------------------- 文字增强
+
+class TextInfo(NamedTuple):
+    text: np.ndarray   # 正文行里的笔画（bool）
+    wide: np.ndarray   # 其中属于够宽的正文行的笔画（bool）
+    band: np.ndarray   # 正文行所在的区域（bool），笔画之间的空白也在内
+    ext_dark: np.ndarray  # 行延伸出来的部分里，源行笔画的暗度（黑帽值 95 分位）；其余为 0
+    char_h: float      # 字高
+    bh: np.ndarray     # 笔画尺度的暗度（黑帽值）
+    ds: np.ndarray     # 平滑后的黑帽值
+    lo: float          # 笔画暗度下限
+    n_lines: int       # 正文行数
+
+
+def find_text(img: np.ndarray, bg: tuple[int, int, int]) -> TextInfo:
+    """找出白纸上正文行里的文字笔画（包括淡到只比纸色暗几个灰度的字）。
+
+      - 暗度按笔画尺度算（黑帽变换）：比笔画宽得多的阴影、污渍、折痕、亮度渐变不计；
+      - 笔画按行组织：锐利边缘在一个字大小窗口里的密度连成行段，只有暗度够、边缘锐利（字是印出来的，
+        边缘清楚；污渍、透字、扫描阴影边缘发虚）、笔画不粗的段才算正文；
+      - 已确认的行沿行方向延伸到整个版心宽度（整片墨粉不足的淡字也算进来）；
+      - 底色偏暗（页边阴影、色块）的地方、与图片边缘相连的墨迹不算。
+    行外的零星墨点、成片污渍一概不算文字。
+    """
+    H, W = img.shape[:2]
+    side = min(H, W)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    k = max(9, int(ENHANCE_STROKE * side) | 1)
+    bh = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))).astype(np.float32)
+    ds = cv2.GaussianBlur(bh, (0, 0), max(1.0, 0.0008 * side))  # 扫成断点的笔画连成线
+    # 大部分像素是纸：以高分位作为纸面噪声水平，笔画至少要高出它
+    lo = max(ENHANCE_MIN_DARK, 2.5 * float(np.percentile(ds, 85)))
+    weak = (ds > lo).astype(np.uint8)
+    # 正文行：锐利边缘（印刷字的笔画边缘清楚，污渍、透字、扫描阴影边缘发虚）在一个字大小的窗口里的密度。
+    # 淡字的笔画常被扫成断点，按单个连通域找会漏掉整段，按密度找则整行连成一片
+    g = cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32)
+    grad = np.hypot(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+    edge = ((grad > ENHANCE_EDGE) & (weak > 0)).astype(np.float32)
+    kx, ky = max(3, int(0.03 * side)), max(3, int(0.01 * side))
+    seg = (cv2.blur(edge, (kx, ky)) > ENHANCE_EDGE_DENSITY).astype(np.uint8)
+    ns, labs, ss, _ = cv2.connectedComponentsWithStats(seg, connectivity=8)
+    labs = np.asarray(labs, np.int32)
+    # 字高：够长的行段高度的中位数（减去窗口带来的外扩）
+    tall = ss[1:, 3][(ss[1:, 2] >= 2 * ss[1:, 3]) & (ss[1:, 2] >= 0.08 * side)]
+    char_h = max(float(np.median(tall)) - ky, 8.0) if tall.size else 0.02 * H
+
+    # 逐段检查是否像文字：暗度够、边缘锐利、笔画不粗（成片的污渍、阴影最厚处远超笔画宽度）
+    ok = np.zeros(ns, bool)
+    for i in range(1, ns):
+        x, y, w, h, _ = ss[i]
+        sel = (labs[y:y + h, x:x + w] == i) & (weak[y:y + h, x:x + w] > 0)
+        if int(sel.sum()) < 0.1 * char_h * char_h:
+            continue
+        if h > 6 * char_h:  # 标题字可能有正文的两三倍高，再高就是成片的东西
+            log.debug("    文字行: 区域 (%d,%d) %dx%d 太高，不算", x, y, w, h)
+            continue
+        sharp = float(np.percentile(grad[y:y + h, x:x + w][sel], 90))
+        dark = float(np.percentile(bh[y:y + h, x:x + w][sel], 95))
+        dt = cv2.distanceTransform(np.pad(sel, 1).astype(np.uint8), cv2.DIST_L2, 3)[1:-1, 1:-1]
+        thick = float(np.percentile(dt[sel], 95))
+        if sharp >= ENHANCE_SHARP and dark >= ENHANCE_LINE_DARK and thick <= 0.3 * char_h:
+            ok[i] = True
+        else:
+            log.debug("    文字行: 区域 (%d,%d) %dx%d 不像文字（锐度 %.0f，暗度 %.0f，粗细 %.1f）",
+                      x, y, w, h, sharp, dark, thick)
+    # 合格的段沿行方向接起来：同一行里极淡的几个字夹在中间也算正文
+    line = cv2.morphologyEx(ok[labs].astype(np.uint8), cv2.MORPH_CLOSE,
+                            np.ones((1, max(3, int(0.06 * side))), np.uint8))
+    nl, labl, sl, _ = cv2.connectedComponentsWithStats(line, connectivity=8)
+    labl = np.asarray(labl, np.int32)
+    good = np.zeros(nl, bool)
+    good[1:] = (sl[1:, 2] >= 1.5 * char_h) | (sl[1:, 4] >= 2 * char_h * char_h)  # 至少一两个字
+    band = good[labl]
+    # 墨粉不足常是整页中间一大片淡到几乎看不见（边缘梯度都不够），一行里只剩两头被认出来：
+    # 已确认的行沿行方向延伸到整个版心宽度，行内这一段的淡笔画也算正文
+    wide = [i for i in np.flatnonzero(good) if sl[i, 2] >= 0.2 * W]
+    # 延伸出来的部分记下源行笔画的暗度：延伸本是为墨粉不足的淡行准备的，本来就清楚的行延伸出去的地方
+    # （行尾的空白、背面透字）不该加深
+    ext_dark = np.zeros((H, W), np.float32)
+    if wide:
+        bx0 = int(min(sl[i, 0] for i in wide))
+        bx1 = int(max(sl[i, 0] + sl[i, 2] for i in wide))
+        for i in np.flatnonzero(good):
+            x, y, w, h, _ = sl[i]
+            # 只延伸本身就有几个字长的行：页边的短小记号、角标延伸出去会扫过背面透字、空白处
+            if h <= 2 * char_h and w >= 4 * char_h:
+                band[y:y + h, min(bx0, x):max(bx1, x + w)] = True
+                own = (labl[y:y + h, x:x + w] == i) & (weak[y:y + h, x:x + w] > 0)
+                d = float(np.percentile(bh[y:y + h, x:x + w][own], 95)) if own.any() else 0.0
+                sub = ext_dark[y:y + h, min(bx0, x):max(bx1, x + w)]
+                np.maximum(sub, d, out=sub)
+        # 延伸出来的部分没经过逐段检查，可能压到页角的污渍、阴影：其中成片的厚块（远比笔画粗）不算
+        dt = cv2.distanceTransform(weak, cv2.DIST_L2, 3)
+        r = max(3, int(0.3 * char_h))
+        blob = cv2.dilate((dt > 0.15 * char_h).astype(np.uint8),
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
+        band &= good[labl] | (blob == 0)
+    # 紧贴图片边缘的一圈是扫描边缘、相邻页残迹，不是正文
+    e = max(3, int(0.015 * side))
+    band[:e], band[-e:], band[:, :e], band[:, -e:] = False, False, False, False
+    # 只认白纸上的字：底色本身偏暗的地方（页边阴影、色块里的反白字、成片的污渍）不动
+    paper = float(np.mean(bg))
+    # （底色取几个字大小窗口里的中值：字只占一小部分，中值就是纸色；不能用闭运算，色块里的反白小字会把它撑亮）
+    sm = cv2.resize(gray, (max(1, W // 8), max(1, H // 8)), interpolation=cv2.INTER_AREA)
+    base = cv2.resize(cv2.medianBlur(sm, 15), (W, H), interpolation=cv2.INTER_LINEAR)
+    band &= base >= paper - ENHANCE_BASE_TOL
+    text = ((weak > 0) & band).astype(np.uint8)
+    # 和图片边缘连着的（页边阴影、扫描边缘的灰带）不算
+    labt = np.asarray(cv2.connectedComponents(text, connectivity=8)[1], np.int32)
+    edge_lab = np.unique(np.r_[labt[0], labt[-1], labt[:, 0], labt[:, -1],
+                               labt[e], labt[-e - 1], labt[:, e], labt[:, -e - 1]])
+    text = (text > 0) & ~np.isin(labt, edge_lab[edge_lab > 0])
+    # 够宽的正文行（至少占版面五分之一宽）本身的笔画：零碎的短“行”可能是条纹、污渍的碎块
+    wide_line = np.isin(labl, [i for i in np.flatnonzero(good) if sl[i, 2] >= 0.2 * W])
+    ext_dark[good[labl]] = 0  # 行本身按局部判断，只有延伸出来的部分按源行
+    return TextInfo(text, text & wide_line, band, ext_dark, char_h, bh, ds, lo, int(good.sum()))
+
+
+def interp_strokes(bh: np.ndarray, band: np.ndarray, char_h: float, side: int, lo: float,
+                   keep: np.ndarray | None = None) -> np.ndarray:
+    """正文行里的细笔画插值：返回 0~1 的加深强度。
+
+    墨粉不足时笔画只剩 1~2 像素宽的细线，还断成一串点，按单个像素判断要么漏掉、要么加深出来是一串麻点。
+    把行内的笔画暗度（黑帽值）做高斯插值，相邻的断点连成连续的笔画；再除以附近最强的笔画做归一化
+    （淡字和深字同样处理），平滑地阈值化成笔画。插值只在正文行里做，行外的东西一概不碰；
+    插值后仍是孤零零的小点（行内的噪点）不加深。只能连起两头都有残留的断笔，整段没扫进来的笔画补不回来。
+    """
+    sigma = ENHANCE_INTERP_SIGMA * max(1.0, side / 2480)
+    src = bh * band
+    if keep is not None:
+        src[keep > 0] = 0
+    s = cv2.GaussianBlur(src, (0, 0), sigma)
+    win = max(3, int(0.6 * char_h) | 1)
+    peak = cv2.GaussianBlur(cv2.dilate(s, np.ones((win, win), np.uint8)), (0, 0), char_h / 3)
+    u = np.clip((s / np.maximum(peak, 1.0) - ENHANCE_INTERP_LOW) / ENHANCE_INTERP_RANGE, 0, 1)
+    u = u * u * (3 - 2 * u)  # smoothstep，笔画边缘平滑过渡
+    # 插值后暗度太低的是纸：纸面干净时 1 个灰度就算，纸面噪声大（lo 高）时按噪声水平抬高
+    u[(s < max(0.8, 0.3 * lo)) | ~band] = 0
+    # 行内孤零零的小点不是笔画
+    n, lab, st, _ = cv2.connectedComponentsWithStats((u > 0.5).astype(np.uint8), connectivity=8)
+    small = np.maximum(st[:, 2], st[:, 3]) < max(3, int(0.08 * char_h))
+    small[0] = False
+    lab = np.asarray(lab, np.int32)
+    speck = cv2.dilate(small[lab].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0  # 连同小点的淡边
+    stroke = (lab > 0) & ~small[lab]
+    u[speck & ~stroke] = 0
+    return u.astype(np.float32)
+
+
+def enhance_text(img: np.ndarray, bg: tuple[int, int, int], keep: np.ndarray | None = None,
+                 interp: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    """把正文行里偏淡的笔画加深到接近黑色，返回 (增强后的图, 宽正文行的笔画掩码，供去噪保护)。
+
+    复印件墨粉不足时字迹很淡（只比纸色暗十几个灰度）、笔画还被扫成断续的点。只加深“文字”，不加深噪点：
+      - 只加深 find_text 找出的正文行笔画，行外的零星墨点、成片污渍、阴影一概不动；
+      - 加深幅度按同一个字附近最深的笔画归一化，淡字、深字最后黑度接近；本来就深的像素不再改动；
+      - 只改 Lab 亮度，彩色内容（红头、印章）保持色相；印章保护区不动；
+      - interp：细笔画插值（interp_strokes），把扫成一串断点的淡字连成连续笔画。
+    """
+    text, wide, band, ext_dark, char_h, bh, ds, lo, n_lines = find_text(img, bg)
+    paper = float(np.mean(bg))
+    side = min(img.shape[:2])
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if keep is not None:
+        text &= keep == 0
+        wide &= keep == 0
+    if not text.any():
+        log.info("  增强: 未发现正文行，跳过")
+        return img, wide.astype(np.uint8) * 255
+
+    # 局部笔画对比度：同一个字附近最深的笔画；加深后淡字和深字一样黑
+    win = max(3, int(0.6 * char_h) | 1)
+    hi = cv2.GaussianBlur(cv2.dilate(ds * text, np.ones((win, win), np.uint8)), (0, 0), char_h / 3)
+    hi = np.maximum(hi, 2 * lo)
+    # 判断“是不是淡字”时，行延伸出来的地方看源行：清楚的行延伸到的空白、透字不加深
+    hi_fade = np.maximum(hi, ext_dark)
+    # 暗度达到 ENHANCE_FULL 的笔画一律加到全黑：旁边的深字不能把极淡的字压住
+    full = np.minimum(0.6 * hi, ENHANCE_FULL)
+    # 用黑帽值本身（不是平滑后的），否则深笔画周围的淡晕也会被加黑，字变粗变糊；
+    # 小核闭运算只补上笔画里扫断的一两个像素的缺口，不向外扩
+    kc = max(3, int(0.002 * side) | 1)
+    dd = cv2.morphologyEx(bh, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kc, kc)))
+    t = np.clip((dd - lo) / np.maximum(full - lo, 1), 0, 1) ** 0.7
+    m = cv2.GaussianBlur(cv2.dilate(text.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32), (0, 0), 1.0)
+    # 本来就清楚的字（附近最深的笔画已经够深）逐渐不再加深：只救淡字，不把正常的字描粗
+    fade = np.clip((ENHANCE_CLEAR - hi_fade) / (ENHANCE_CLEAR - ENHANCE_FAINT), 0, 1)
+    m *= fade
+    if keep is not None:
+        m[keep > 0] = 0
+    v = t * m
+    if interp:
+        # 插值只给真正很淡的字用：清楚的字插值只会在笔画外描出一圈灰晕
+        faint = np.clip((ENHANCE_INTERP_CLEAR - hi_fade) / (ENHANCE_INTERP_CLEAR - ENHANCE_INTERP_FAINT), 0, 1)
+        v = np.maximum(v, interp_strokes(bh, band, char_h, side, lo, keep) * faint)
+    g = gray.astype(np.float32)
+    # 只往深里改：已经比目标深的像素不动
+    drop = np.maximum(g - (paper - v * (paper - ENHANCE_INK)), 0)
+    lab_img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_img[..., 0] = np.clip(lab_img[..., 0] - drop, 0, 255)  # OpenCV 8 位 Lab 的 L 也是 0~255
+    out = cv2.cvtColor(np.round(lab_img).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    log.info("  增强: 正文行 %d 行，字高 %.0fpx，加深 %.2f%% 的面积（暗度下限 %.1f）",
+             n_lines, char_h, 100 * float((drop > 30).mean()), lo)
+    return out, wide.astype(np.uint8) * 255
+
+
 # ---------------------------------------------------------------- 方向检测与旋转校正
 
 def rotate_cw(img: np.ndarray, deg: int) -> np.ndarray:
@@ -1104,7 +1346,14 @@ def process(path: Path, args: argparse.Namespace) -> bool:
     else:
         log.info("  方向/倾斜: 已关闭")
 
-    # 4. 版心外噪点
+    # 4. 淡字加深：在去噪之前做，去噪才能按完整的字确定版心和字高，不会把淡字当成淡色痕迹抹掉
+    if args.enhance:
+        out, text = enhance_text(out, bg, keep, args.interp)
+    else:
+        text = np.zeros(out.shape[:2], np.uint8)
+        log.info("  增强: 已关闭")
+
+    # 5. 版心外噪点
     if not args.denoise:
         log.info("  去噪: 已关闭")
     else:
@@ -1114,7 +1363,8 @@ def process(path: Path, args: argparse.Namespace) -> bool:
             log.warning("  去噪: 方向未确认且文字行不呈横排（行方向比 %.2f < %.2f），为避免误删内容，跳过",
                         ratio, VERTICAL_TEXT)
         else:
-            out = inpaint(out, margin_noise_mask(out, bg, args.noise, cleaned), keep)
+            # 正文行里的笔画（哪怕加深后仍偏淡）和印章一样不许去噪改动
+            out = inpaint(out, margin_noise_mask(out, bg, args.noise, cleaned), cv2.bitwise_or(keep, text))
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     dst = OUTPUT_DIR / path.name
@@ -1132,6 +1382,9 @@ def main() -> int:
     ap.add_argument("--no-rotate", dest="rotate", action="store_false",
                     help="关闭方向检测与倾斜校正（默认开启，需安装 tesseract）")
     ap.add_argument("--no-denoise", dest="denoise", action="store_false", help="关闭版心外去噪点（默认开启）")
+    ap.add_argument("--no-enhance", dest="enhance", action="store_false", help="关闭正文淡字加深（默认开启）")
+    ap.add_argument("--no-interp", dest="interp", action="store_false",
+                    help="关闭淡字的细笔画插值，只按像素加深（默认开启）")
     ap.add_argument("-n", "--noise", type=float, default=NOISE_RATIO,
                     help=f"噪点阈值：孤立墨点最大尺寸占字高的比例，越大清除越多(默认{NOISE_RATIO})")
     ap.add_argument("-v", "--verbose", action="store_true", help="输出详细检测日志")

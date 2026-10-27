@@ -11,4 +11,5 @@ wheels/
 
 # 测试图片与处理结果
 test/
+test2/
 output/
