@@ -7,11 +7,12 @@
   3. 小角度倾斜校正，旋转后露出的空角用周围纸张纹理修补
   4. 正文淡字加深（只加深成行的文字笔画，不加深噪点、污渍、阴影；本来就清楚的字不动），
      很淡的字再做细笔画插值，把扫成一串断点的笔画连成连续的线
-  5. 去除版心之外的零星噪点（正文行的笔画不动）
+  5. 去除版心之外的零星噪点，以及版心内远离文字、表格线的墨粉散点（正文行的笔画不动）
 
 “宁可不转，也不错转”：方向需在四个旋转副本上检测一致、且与文字行方向不矛盾才旋转；
-倾斜角需峰值明显、两种分辨率下结果一致才校正；校正若会把内容转出画布，则改为扩展画布。
-不旋转、不倾斜校正时输出尺寸与原图一致。
+倾斜角需峰值明显、两种分辨率下结果一致才校正；保持原尺寸，内容会转出画布时整体平移，
+只允许本来就被图片边缘截断的墨迹再转出去一点，否则不校正。
+除 90°/270° 方向旋转会交换宽高外，输出尺寸与原图一致。
 
 用法: python pic.py "图片路径或目录" [-t 阈值] [-m 扩展像素] [--no-rotate] [--no-enhance] [--no-interp] [--no-denoise] [-n 噪点阈值] [-v]
 结果保存到 ./output 目录，文件名与原图相同。
@@ -27,6 +28,8 @@ from typing import NamedTuple
 
 import cv2
 import numpy as np
+from scipy.spatial import cKDTree
+from skimage.morphology import skeletonize
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 log = logging.getLogger("pic")
@@ -77,16 +80,10 @@ ENHANCE_EDGE_DENSITY = 0.03
 ENHANCE_SHARP = 35.0
 ENHANCE_LINE_DARK = 20.0
 ENHANCE_INK = 30.0
-ENHANCE_FULL = 30.0  # 笔画暗度（黑帽值）达到它即加深到目标墨色
 # 附近笔画暗度（黑帽值）低于 ENHANCE_FAINT 的是淡字，完全加深；高于 ENHANCE_CLEAR 的字本来就清楚，不动
 ENHANCE_FAINT = 70.0
 ENHANCE_CLEAR = 140.0
 ENHANCE_BASE_TOL = 12.0  # 局部底色比纸色暗超过它（阴影、色块）就不加深
-# 细笔画插值：高斯插值的 sigma（像素，按 2480px 短边换算）；插值后暗度占附近最强笔画的比例，
-# 从 LOW 起开始算笔画，到 LOW + RANGE 加到全黑
-ENHANCE_INTERP_SIGMA = 1.3
-ENHANCE_INTERP_LOW = 0.12
-ENHANCE_INTERP_RANGE = 0.3
 # 附近笔画暗度（黑帽值）低于 FAINT 才完全插值，高于 CLEAR 不插值
 ENHANCE_INTERP_FAINT = 45.0
 ENHANCE_INTERP_CLEAR = 80.0
@@ -283,8 +280,15 @@ def _arc_on_right(g: np.ndarray, paper: float, side: int, t: int) -> np.ndarray 
         sp1, cv1, _ = score(np.array([c1]), np.array([c2]), np.array([r1]))
         if rmin <= r1 <= rmax and cv1[0] >= cover[b]:
             cx0, cy0, r0 = c1, c2, r1
-    log.debug("    贴边残缺圆弧（边 %d°）：圆心 (%.0f,%.0f) 半径 %.0f，可见 %.0f°，覆盖 %.2f，两侧 %.2f",
-              t, cx0 + x_off, cy0, r0, span[b], cover[b], side_ink[b])
+    # 印章圈内大部分是纸，只有印文笔画；成片的灰色阴影、手印的边沿也可能弯成一段圆弧，但圈内整片发灰
+    inner = np.zeros((h, sw), np.uint8)
+    cv2.circle(inner, (int(round(cx0)), int(round(cy0))), max(1, int(round(r0 - tol))), 1, -1)
+    fill = float((sub[inner > 0] < paper - 25).mean()) if inner.any() else 0.0
+    if fill > 0.5:
+        log.debug("    贴边圆弧（边 %d°）圈内 %.0f%% 发灰，是阴影或污渍的边沿，不是印章", t, 100 * fill)
+        return None
+    log.debug("    贴边残缺圆弧（边 %d°）：圆心 (%.0f,%.0f) 半径 %.0f，可见 %.0f°，覆盖 %.2f，两侧 %.2f，圈内发灰 %.0f%%",
+              t, cx0 + x_off, cy0, r0, span[b], cover[b], side_ink[b], 100 * fill)
     m = np.zeros((h, w), np.uint8)
     cv2.circle(m, (int(round(cx0 + x_off)), int(round(cy0))), int(round(r0 + 2 * tol)), 255, -1)
     return m
@@ -294,19 +298,37 @@ def edge_dark_seed(gray: np.ndarray, bg: tuple[int, int, int], thresh: int) -> n
     """与图片边缘相连的深色连通域，加上最外圈几个像素里偏暗的残留：黑边的“种子”。"""
     H, W = gray.shape
     dark = (gray < thresh).astype(np.uint8)
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    # 黑边是厚实的色块；伸到图片边缘的表格线、与之相交的笔迹都是细线，开运算后消失，不能作种子，
+    # 否则整张表格线网连同签名会被当成一个贴边连通域整块清掉
+    k = max(11, int(min(H, W) * 0.005) | 1)
+    thick = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     min_area = max(30, int(H * W * 0.00005))
+
+    # 最外圈几个像素几乎一定是扫描边缘，偏暗的残留一并清掉
+    rim = gray < int(np.mean(bg)) - 40
     seed = np.zeros((H, W), np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(thick, connectivity=8)
     for i in range(1, n):
         x, y, w, h, area = stats[i]
-        touches = x == 0 or y == 0 or x + w == W or y + h == H
-        if touches and (area >= min_area or min(w, h) <= 6):  # 贴边的细碎黑线也要清
+        if (x == 0 or y == 0 or x + w == W or y + h == H) and area >= min_area:
             seed[lab == i] = 255
-    # 最外圈几个像素几乎一定是扫描边缘，偏暗的残留一并清掉
-    f = 4
-    frame = np.zeros((H, W), np.uint8)
-    frame[:f], frame[-f:], frame[:, :f], frame[:, -f:] = 255, 255, 255, 255
-    return seed | (frame & (gray < int(np.mean(bg)) - 40).astype(np.uint8) * 255)
+    # 沿边缘走向的长细线才是扫描边缘残留；横穿边缘被截断的字（如序号“10”的“1”）、表格线头不算，
+    # 被截成竖条的“1”也只有一个字高，比扫描残线短得多。四条边分开看，免得在页角连成一圈
+    d = max(6, int(0.01 * min(H, W)))
+    for m, depth in ((dark > 0, d), (rim, 4)):
+        for t in (0, 90, 180, 270):  # 依次把四条边转到左侧
+            sm = rotate_cw(m.astype(np.uint8), t)
+            h_, w_ = sm.shape
+            strip = np.zeros_like(sm)
+            strip[:, :depth] = sm[:, :depth]
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(strip, connectivity=8)
+            out = np.zeros_like(sm)
+            for i in range(1, n):
+                x, y, w, h, area = stats[i]
+                if x == 0 and h >= max(3 * w, 0.03 * h_):
+                    out[lab == i] = 255
+            seed |= rotate_cw(out, (360 - t) % 360)
+    return seed
 
 
 def trim_keep_at_border(keep: np.ndarray, img: np.ndarray, bg: tuple[int, int, int], thresh: int,
@@ -741,6 +763,82 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
         n_faint += 1
         log.debug("    清除浅色墨点 (%d,%d) %dx%d", x, y, w, h)
 
+    # 版心内的散点（表格空白格里成片的墨粉点、印章透印的碎点）：比墨点上限小、半个字高内没有任何大墨迹
+    # （字、笔画、表格线），也不带颜色。字旁的标点、小数点离字很近，紧贴表格线的点也不动
+    r_in = max(3, int(0.5 * char_h))
+    # 表格线、下划线这样的长直线不说明附近有字，不保护紧挨着它的散点
+    # 长度要远超一行里相邻几个字的横笔连起来的长度，否则整行字会被当成直线挖掉
+    Ln = max(int(5 * char_h), W // 20, H // 20)
+    faint = (gray < paper - 15).astype(np.uint8)  # 按浅色阈值找，颜色偏浅的一段表格线也算
+    # 先补上线里的小断口（印刷、扫描造成的白点），断续的表格线才能被整条找出来
+    straight = cv2.morphologyEx(cv2.morphologyEx(faint, cv2.MORPH_CLOSE, np.ones((1, 5), np.uint8)),
+                                cv2.MORPH_OPEN, np.ones((1, Ln), np.uint8)) \
+        | cv2.morphologyEx(cv2.morphologyEx(faint, cv2.MORPH_CLOSE, np.ones((5, 1), np.uint8)),
+                           cv2.MORPH_OPEN, np.ones((Ln, 1), np.uint8))
+    straight &= cv2.dilate(faint, np.ones((3, 3), np.uint8))  # 只留真有墨迹的地方，不把补出来的断口当线
+    line_px = cv2.dilate(straight, np.ones((7, 7), np.uint8)) * 255  # 清散点时不许碰表格线本身
+    straight = cv2.dilate(straight, np.ones((5, 5), np.uint8))
+    inner = np.zeros((H, W), np.uint8)
+    # 先去掉长直线再分连通域：粘在表格线上的碎点也能单独拆出来，不再算作表格这个大墨迹的一部分
+    n8, lab8, st8, cen8 = cv2.connectedComponentsWithStats(ink & (straight == 0), connectivity=8)
+    big8 = np.maximum(st8[:, 2], st8[:, 3]) > speck
+    big8[0] = False
+    big_px = big8[lab8].astype(np.uint8) * 255
+    big_near = cv2.dilate(big_px,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_in + 1,) * 2))
+    # 墨粉不足的字本身就断成一串小点，单看大小和邻居分不出来：正文行（按行结构识别）里一概不动
+    band = cv2.dilate(find_text(img, bg).band.astype(np.uint8), np.ones((r_in, r_in), np.uint8))
+    big_near |= band
+    # 行外的小号字（表格格子里的标签、页末的短行）同样会碎成小块：相距很近的碎块连成一团后，
+    # 字的团有小半个字以上大、团内墨迹密；散点要么单独一颗，要么连成的团很稀疏
+    kc = max(3, int(0.1 * char_h)) | 1
+    clus = cv2.dilate((ink & (straight == 0)).astype(np.uint8),
+                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kc, kc)))
+    n9, lab9, st9, _ = cv2.connectedComponentsWithStats(clus, connectivity=8)
+    fill9 = np.bincount(lab9[(ink > 0) & (straight == 0)], minlength=n9) / np.maximum(st9[:, 4], 1)
+    # 印得很淡的小字团内墨迹也稀，但碎块里总有细长的笔画；墨粉点是一颗颗圆团
+    long8 = np.maximum(st8[:, 2], st8[:, 3])
+    stroke8 = (long8 >= 2.5 * np.minimum(st8[:, 2], st8[:, 3])) & (long8 >= 0.15 * char_h)
+    stroke8[0] = False
+    has_stroke = np.zeros(n9, bool)
+    has_stroke[np.unique(lab9[stroke8[lab8]])] = True
+    charlike = (np.maximum(st9[:, 2], st9[:, 3]) >= 0.2 * char_h) & ((fill9 >= 0.25) | (fill9 >= 0.15) & has_stroke)
+    charlike[0] = False
+    # 和大墨迹一样保护半个字高：字旁的冒号、顿号离字稍远，也不能当散点
+    big_near |= cv2.dilate(charlike[lab9].astype(np.uint8),
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_in + 1,) * 2))
+    # 散点周围还有一层只比纸色暗十几个灰度的雾点。按这个浅色阈值连通：印刷的字哪怕深色部分断成碎块，
+    # 浅色下笔画仍连成字大小的一块；墨粉散点在浅色下也还是一颗颗分开的小点
+    haze = faint & (straight == 0)
+    n7, lab7, st7, cen7 = cv2.connectedComponentsWithStats(haze, connectivity=8)
+    lab7 = np.asarray(lab7, np.int32)
+    small7 = np.maximum(st7[:, 2], st7[:, 3]) <= speck
+    small7[0] = False
+    touch = np.zeros(n7, bool)  # 碰到大墨迹附近、或带颜色的不动
+    touch[np.unique(lab7[(big_near > 0) | (chroma > 2 * COLOR_MIN)])] = True
+    in_body = ~out_c(cen7)
+    fog_ok = small7 & ~touch & in_body
+    n_inner = 0
+    for i in range(1, n8):
+        x, y, w, h, area = st8[i]
+        cx, cy = cen8[i]
+        if outside[int(min(cy, H - 1)), int(min(cx, W - 1))] or max(w, h) > speck \
+                or (max(w, h) > 4 and max(w, h) > 3 * min(w, h)):
+            continue
+        sel = lab8[y:y + h, x:x + w] == i
+        x0_, y0_, x1_, y1_ = max(0, x - 2), max(0, y - 2), min(W, x + w + 2), min(H, y + h + 2)
+        if big_near[y:y + h, x:x + w][sel].any() or colored(sel, x, y, w, h) \
+                or not small7[lab7[y:y + h, x:x + w][sel]].all() \
+                or straight[y0_:y1_, x0_:x1_].any():  # 紧贴表格线的可能是线抖开的一截
+            continue
+        inner[y:y + h, x:x + w][sel] = 255
+        n_inner += 1
+    # 雾点留着会被修补抹成灰色拖影：同样远离大墨迹的浅灰小块一并清掉；
+    # 但块里有没判成散点的深色笔画，就是字的一部分，不是雾
+    fog_ok[np.unique(lab7[(ink > 0) & (inner == 0)])] = False
+    inner[fog_ok[lab7]] = 255
+    log.info("  去噪: 清除版心内散点 %d 处、浅灰雾点 %d 处", n_inner, int(fog_ok.sum()))
+
     # 页边的直线角标、裁切线残段（多是扫描仪留下的灰色细线）：浅色阈值下整块几乎全由横、竖直线构成，
     # 而且是一横一竖拐角相接的角标。单独的竖线可能是手写的“1”或装订孔方框断开的一边，
     # 三面、四面都有边的是装订孔的方框，都不动
@@ -774,6 +872,8 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
     log.info("  去噪: 清除贴边笔迹 %d 处、孤立墨点 %d 处、浅色墨点 %d 处、直线角标 %d 处（墨点尺寸上限 %dpx = 字高 %.0fpx × %.2f）",
              n_edge, n_speck, n_faint, n_line, speck, char_h, noise_ratio)
     kill = cv2.dilate(kill, np.ones((7, 7), np.uint8))
+    # 外扩时不许碰表格线（连同两侧）和字、笔画这样的大墨迹
+    kill |= cv2.dilate(inner, np.ones((7, 7), np.uint8)) & cv2.bitwise_not(line_px | big_px)
     # 大一点的墨团外面还有一圈更淡的晕，只清到浅色阈值会留下一个灰影：连着它的淡色小块一并清掉
     # （一两个像素的小点不扩，它们常是浅色印章、浅色字里的深色像素）
     if blob.any():
@@ -807,7 +907,17 @@ def margin_noise_mask(img: np.ndarray, bg: tuple[int, int, int], noise_ratio: fl
     hit[np.unique(lab5[(diff > 7) & (weak > 0)])] = True
     hit[0] = False
     # 真正的墨迹：深色像素，以及不比墨点小的浅色笔画（装订孔方框、浅色手写字）；没清掉的零碎浅色小点不算
-    real = ((gray < paper - 50) | (np.maximum(st3[:, 2], st3[:, 3]) >= speck)[lab3] & (soft > 0)) & (kill == 0)
+    real = (gray < paper - 50) | (np.maximum(st3[:, 2], st3[:, 3]) >= speck)[lab3] & (soft > 0)
+    # 灰色的阴影、污渍（如页顶的手印、压痕）中心也可能比纸暗 50 以上，但它不是笔画：成片的略暗区域里
+    # 有远比笔画厚的地方。这样的整片（连同陡峭的边沿）里中等深度的像素不算墨迹；真正的黑墨迹不管在哪都算
+    shade = (gray < paper - 25).astype(np.uint8)
+    n6, lab6 = cv2.connectedComponents(shade, connectivity=8)
+    lab6 = np.asarray(lab6, np.int32)
+    dt = cv2.distanceTransform(shade, cv2.DIST_L2, 3)
+    thick = np.zeros(n6, bool)
+    thick[np.unique(lab6[dt > max(4.0, 0.3 * char_h)])] = True
+    thick[0] = False
+    real = ((gray < paper - 120) | real & ~thick[lab6]) & (kill == 0)
     real = real.astype(np.uint8)
     r = max(3, int(0.5 * char_h))
     guard = cv2.dilate(real, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2))
@@ -884,6 +994,7 @@ def inpaint(img: np.ndarray, mask: np.ndarray, keep: np.ndarray | None = None) -
     sigma = max(1.0, 0.002 * min(H, W))
     alpha = cv2.GaussianBlur(mask.astype(np.float32) / 255, (0, 0), sigma)[..., None]
     alpha = np.maximum(alpha, (mask > 0)[..., None].astype(np.float32))
+    alpha[(ink > 0) & (mask == 0)] = 0  # 羽化不渗入掩码外的字迹、表格线（修补结果里它们被当作未知抹白了）
     if keep is not None:
         alpha[keep > 0] = 0
     return np.clip(img * (1 - alpha) + fixed * alpha, 0, 255).astype(np.uint8)
@@ -962,7 +1073,6 @@ def find_text(img: np.ndarray, bg: tuple[int, int, int]) -> TextInfo:
     labl = np.asarray(labl, np.int32)
     good = np.zeros(nl, bool)
     good[1:] = (sl[1:, 2] >= 1.5 * char_h) | (sl[1:, 4] >= 2 * char_h * char_h)  # 至少一两个字
-    band = good[labl]
     # 墨粉不足常是整页中间一大片淡到几乎看不见（边缘梯度都不够），一行里只剩两头被认出来：
     # 已确认的行沿行方向延伸到整个版心宽度，行内这一段的淡笔画也算正文
     wide = [i for i in np.flatnonzero(good) if sl[i, 2] >= 0.2 * W]
@@ -972,6 +1082,11 @@ def find_text(img: np.ndarray, bg: tuple[int, int, int]) -> TextInfo:
     if wide:
         bx0 = int(min(sl[i, 0] for i in wide))
         bx1 = int(max(sl[i, 0] + sl[i, 2] for i in wide))
+        # 版心左右两侧之外的短“行”是页边的装订孔、记号、扫描灰带上的碎纹，不是正文
+        cx = sl[:, 0] + sl[:, 2] / 2
+        good &= (sl[:, 2] >= 0.2 * W) | ((cx >= bx0 - char_h) & (cx <= bx1 + char_h))
+    band = good[labl]
+    if wide:
         for i in np.flatnonzero(good):
             x, y, w, h, _ = sl[i]
             # 只延伸本身就有几个字长的行：页边的短小记号、角标延伸出去会扫过背面透字、空白处
@@ -1008,46 +1123,219 @@ def find_text(img: np.ndarray, bg: tuple[int, int, int]) -> TextInfo:
     return TextInfo(text, text & wide_line, band, ext_dark, char_h, bh, ds, lo, int(good.sum()))
 
 
+def repair_stroke_gaps(ink: np.ndarray, signal: np.ndarray, valid: np.ndarray,
+                       char_h: float, noise: float) -> np.ndarray:
+    """用 Zhang 骨架端点及双向切线匹配修补短断笔，保留原有笔画宽度。
+
+    skeletonize 来自 scikit-image；只有两端互相朝向、间距短、路径无第三条
+    笔画的候选才连接。较长断口还须有浅墨迹支持，不按字义猜测缺失内容。
+    """
+    core = (ink >= 0.25) & valid
+    if not core.any():
+        return ink
+    skeleton = skeletonize(core, method="zhang").astype(np.uint8)
+    degree = cv2.filter2D(skeleton, cv2.CV_16S, np.ones((3, 3), np.int16)) - skeleton
+    ys, xs = np.nonzero((skeleton > 0) & (degree == 1))
+    if len(xs) < 2:
+        return ink
+    points = np.column_stack((xs, ys)).astype(np.float64)
+    max_gap = float(np.clip(0.2 * char_h, 3.0, 12.0))
+    radius = max(3, int(round(min(5, 0.1 * char_h))))
+    tangents = np.zeros_like(points)
+    h, w = ink.shape
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        x0, x1, y0, y1 = max(0, x-radius), min(w, x+radius+1), max(0, y-radius), min(h, y+radius+1)
+        patch = skeleton[y0:y1, x0:x1]
+        # 只沿本端点所在分支追踪，邻近的平行笔画不参与方向估计。
+        _, labels = cv2.connectedComponents(patch, connectivity=8)
+        yy, xx = np.nonzero(labels == labels[y-y0, x-x0])
+        offsets = np.column_stack((xx+x0-x, yy+y0-y))
+        far = np.linalg.norm(offsets, axis=1) >= 2
+        if far.any():
+            direction = -offsets[far].mean(axis=0)
+            norm = np.linalg.norm(direction)
+            if norm > 0.5:
+                tangents[i] = direction / norm
+    candidates = []
+    tree = cKDTree(points)
+    for i, j in sorted(tree.query_pairs(max_gap)):
+        delta = points[j] - points[i]
+        distance = float(np.linalg.norm(delta))
+        if distance < 2:
+            continue
+        direction = delta / distance
+        alignment = min(float(tangents[i] @ direction), float(-tangents[j] @ direction))
+        if alignment < 0.8:
+            continue
+        # 在像素中心采样直线；拒绝保护区、越界及穿过其他笔画的连接。
+        samples = np.rint(np.linspace(points[i], points[j], max(3, int(distance*2)+1))).astype(int)
+        px, py = samples[:, 0], samples[:, 1]
+        if not valid[py, px].all():
+            continue
+        occupied = core[py, px]
+        empty = np.flatnonzero(~occupied)
+        if not len(empty):
+            continue
+        first, last = int(empty[0]), int(empty[-1])
+        if occupied[first:last+1].any():
+            continue
+        # 粗笔画的骨架端点会向内退缩；用真正空白段的长度判断缺口。
+        gap_span = int(np.max(np.abs(samples[last]-samples[first]))) + 1
+        gap_signal = signal[py[first:last+1], px[first:last+1]]
+        evidence = float(np.mean(gap_signal > max(1.0, 0.35*noise)))
+        if gap_span > 3 and evidence < 0.35:
+            continue
+        candidates.append((distance / alignment, i, j))
+    out = ink.copy()
+    used = set()
+    depth = cv2.distanceTransform(core.astype(np.uint8), cv2.DIST_L2, 5)
+    repaired = 0
+    for _, i, j in sorted(candidates):
+        if i in used or j in used:
+            continue
+        x, y = xs[i], ys[i]
+        qx, qy = xs[j], ys[j]
+        pad = 3
+        x0, x1 = max(0, min(x,qx)-pad), min(w, max(x,qx)+pad+1)
+        y0, y1 = max(0, min(y,qy)-pad), min(h, max(y,qy)+pad+1)
+        line = np.zeros((y1-y0, x1-x0), np.uint8)
+        width = int(np.clip(round(2*min(depth[y,x], depth[qy,qx])-1), 1, 3))
+        cv2.line(line, (int(x-x0),int(y-y0)), (int(qx-x0),int(qy-y0)), 255, width, cv2.LINE_AA)
+        strength = min(0.85, float(ink[y,x]), float(ink[qy,qx]))
+        patch = out[y0:y1,x0:x1]
+        bridge = line.astype(np.float32)/255*strength
+        bridge[~valid[y0:y1,x0:x1]] = 0
+        original = ink[y0:y1, x0:x1]
+        if ((patch > 0.25) & (original < 0.25) & (bridge > 0.1)).any():
+            continue  # 不允许后续补线穿过已经新增的连接
+        np.maximum(patch, bridge, out=patch)
+        used.update((i,j))
+        repaired += 1
+    log.info("  断笔修复: 连接 %d 处（最大端点间距 %.1fpx）", repaired, max_gap)
+    return out
+
+
+def directional_strokes(bh: np.ndarray, band: np.ndarray, char_h: float,
+                        side: int, lo: float, keep: np.ndarray | None = None) -> np.ndarray:
+    """16 方向匹配线滤波恢复弱墨迹，法向背景相减抑制笔画两侧灰晕。
+
+    在线结构的灰度上积累证据，不要求断笔已经能二值化为骨架。
+    每行独立处理，保留纸面噪声门槛；无墨迹的长空白不会生成笔画。
+    """
+    valid = band.astype(bool).copy()
+    if keep is not None:
+        valid &= keep == 0
+    result = np.zeros(bh.shape, np.float32)
+    if not valid.any():
+        return result
+    scale = float(np.clip(side / 2480, 0.6, 2.0))
+    length = float(np.clip(0.075 * char_h, 2.0 * scale, 4.5 * scale))
+    normal_offset = 2.0 * scale
+    radius = int(np.ceil(length + 2))
+    size = 2 * radius + 1
+    kernels = []
+    for theta in np.linspace(0, np.pi, 16, endpoint=False):
+        dx, dy = np.cos(theta), np.sin(theta)
+        kernel = np.zeros((size, size), np.float32)
+        for t in np.linspace(-length, length, 65):
+            x, y = radius + t * dx, radius + t * dy
+            ix, iy = int(x), int(y)
+            fx, fy = x - ix, y - iy
+            weight = np.exp(-0.5 * (t / max(length / 2, 1)) ** 2)
+            kernel[iy:iy+2, ix:ix+2] += weight * np.array(
+                [[(1-fx)*(1-fy), fx*(1-fy)], [(1-fx)*fy, fx*fy]], np.float32)
+        kernel /= kernel.sum()
+        yy, xx = np.mgrid[-radius:radius+1, -radius:radius+1]
+        projection = xx * dx + yy * dy
+        half_left = kernel * (projection < -0.5)
+        half_right = kernel * (projection > 0.5)
+        half_left /= half_left.sum()
+        half_right /= half_right.sum()
+        kernels.append((kernel, half_left, half_right, normal_offset * dy, -normal_offset * dx))
+    active = valid.any(axis=1)
+    edges = np.diff(np.r_[False, active, False].astype(np.int8))
+    starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+    win = max(3, int(0.45 * char_h) | 1)
+    pad = int(np.ceil(0.7 * char_h + radius + normal_offset))
+    floor = max(1.2, 0.45 * lo)
+    for start, end in zip(starts, ends):
+        columns = np.flatnonzero(valid[start:end].any(axis=0))
+        x0, x1 = max(0, int(columns[0])-pad), min(bh.shape[1], int(columns[-1])+pad+1)
+        y0, y1 = max(0, start-pad), min(bh.shape[0], end+pad)
+        mask = valid[y0:y1, x0:x1]
+        src = np.where(mask, bh[y0:y1, x0:x1], 0).astype(np.float32)
+        best = np.zeros_like(src)
+        for kernel, half_left, half_right, nx, ny in kernels:
+            along = cv2.filter2D(src, -1, kernel, borderType=cv2.BORDER_REFLECT)
+            transform = np.array([[1, 0, nx], [0, 1, ny]], np.float32)
+            left = cv2.warpAffine(along, transform, (src.shape[1], src.shape[0]),
+                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            transform[:, 2] *= -1
+            right = cv2.warpAffine(along, transform, (src.shape[1], src.shape[0]),
+                                   flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            ridge = np.maximum(along - 0.5 * (left + right), 0)
+            # 空白处只有两侧都存在墨迹才补，避免把端点拖成长尾。
+            backward = cv2.filter2D(src, -1, half_left, borderType=cv2.BORDER_REFLECT)
+            forward = cv2.filter2D(src, -1, half_right, borderType=cv2.BORDER_REFLECT)
+            bilateral = np.minimum(backward, forward)
+            ridge[(src <= lo) & (bilateral < np.maximum(lo, 0.4 * along))] = 0
+            np.maximum(best, ridge, out=best)
+        peak = cv2.GaussianBlur(cv2.dilate(best, np.ones((win, win), np.uint8)),
+                                (0, 0), max(1.0, char_h / 5))
+        u = np.clip((best - floor) / np.maximum(0.65 * peak - floor, max(2.5, 0.7 * lo)), 0, 1)
+        # 原始墨迹附近才允许定向恢复，孤立颗粒不能靠滤波拖出短线。
+        evidence = (src > max(lo, 3.0)).astype(np.uint8)
+        support = cv2.filter2D(evidence.astype(np.float32), -1,
+                               np.ones((3, 3), np.float32)) >= 2
+        reach = max(1, int(np.ceil(length)))
+        support = cv2.dilate(support.astype(np.uint8), np.ones((2*reach+1, 2*reach+1), np.uint8)) > 0
+        u[~mask | ~support] = 0
+        # 只回写当前行，避免重叠上下文使不同分块重复增强。
+        target = result[start:end, x0:x1]
+        np.maximum(target, u[start-y0:end-y0], out=target)
+    return result
+
+
 def interp_strokes(bh: np.ndarray, band: np.ndarray, char_h: float, side: int, lo: float,
                    keep: np.ndarray | None = None) -> np.ndarray:
     """正文行里的细笔画插值：返回 0~1 的加深强度。
 
-    墨粉不足时笔画只剩 1~2 像素宽的细线，还断成一串点，按单个像素判断要么漏掉、要么加深出来是一串麻点。
-    把行内的笔画暗度（黑帽值）做高斯插值，相邻的断点连成连续的笔画；再除以附近最强的笔画做归一化
-    （淡字和深字同样处理），平滑地阈值化成笔画。插值只在正文行里做，行外的东西一概不碰；
-    插值后仍是孤零零的小点（行内的噪点）不加深。只能连起两头都有残留的断笔，整段没扫进来的笔画补不回来。
+    以原始笔画峰值归一化，少量平滑抑制颗粒，保留连续灰阶边缘。
+    普通平滑限于已有墨迹的一像素邻域；再由骨架端点匹配修补短断笔，
+    避免扩散描粗或合并相邻笔画。
     """
-    sigma = ENHANCE_INTERP_SIGMA * max(1.0, side / 2480)
-    src = bh * band
+    # 小于一个像素的平滑只抑制扫描颗粒；不再把扩散出来的灰晕阈值化成黑边。
+    sigma = max(0.35, min(0.8, 0.55 * side / 2480))
+    valid = band.astype(bool).copy()
     if keep is not None:
-        src[keep > 0] = 0
-    s = cv2.GaussianBlur(src, (0, 0), sigma)
+        valid &= keep == 0
+    src = np.where(valid, bh, 0).astype(np.float32)
+    smooth = cv2.GaussianBlur(src, (0, 0), sigma)
     win = max(3, int(0.6 * char_h) | 1)
-    peak = cv2.GaussianBlur(cv2.dilate(s, np.ones((win, win), np.uint8)), (0, 0), char_h / 3)
-    u = np.clip((s / np.maximum(peak, 1.0) - ENHANCE_INTERP_LOW) / ENHANCE_INTERP_RANGE, 0, 1)
-    u = u * u * (3 - 2 * u)  # smoothstep，笔画边缘平滑过渡
-    # 插值后暗度太低的是纸：纸面干净时 1 个灰度就算，纸面噪声大（lo 高）时按噪声水平抬高
-    u[(s < max(0.8, 0.3 * lo)) | ~band] = 0
-    # 行内孤零零的小点不是笔画
-    n, lab, st, _ = cv2.connectedComponentsWithStats((u > 0.5).astype(np.uint8), connectivity=8)
-    small = np.maximum(st[:, 2], st[:, 3]) < max(3, int(0.08 * char_h))
-    small[0] = False
-    lab = np.asarray(lab, np.int32)
-    speck = cv2.dilate(small[lab].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0  # 连同小点的淡边
-    stroke = (lab > 0) & ~small[lab]
-    u[speck & ~stroke] = 0
-    return u.astype(np.float32)
+    peak = cv2.GaussianBlur(cv2.dilate(src, np.ones((win, win), np.uint8)),
+                            (0, 0), max(1.0, char_h / 3))
+    # 用原始笔画的峰值归一化，避免平滑降低峰值后把两侧浅边放大。
+    floor = max(ENHANCE_MIN_DARK, lo)
+    full = np.maximum(0.55 * peak, floor + 6.0)
+    signal = 0.65 * src + 0.35 * smooth
+    u = np.clip((signal - floor) / (full - floor), 0, 1)
+    # 仅允许在已有墨迹的一像素邻域内微量补缺，不向空白扩散。
+    support = cv2.dilate((src > floor).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    added = src <= floor
+    u[added] = np.minimum(u[added], 0.25)
+    u[~valid | ~support] = 0
+    return repair_stroke_gaps(u.astype(np.float32), src, valid, char_h, floor)
 
 
 def enhance_text(img: np.ndarray, bg: tuple[int, int, int], keep: np.ndarray | None = None,
-                 interp: bool = True) -> tuple[np.ndarray, np.ndarray]:
+                 interp: bool = True, text_method: str = "directional") -> tuple[np.ndarray, np.ndarray]:
     """把正文行里偏淡的笔画加深到接近黑色，返回 (增强后的图, 宽正文行的笔画掩码，供去噪保护)。
 
     复印件墨粉不足时字迹很淡（只比纸色暗十几个灰度）、笔画还被扫成断续的点。只加深“文字”，不加深噪点：
       - 只加深 find_text 找出的正文行笔画，行外的零星墨点、成片污渍、阴影一概不动；
       - 加深幅度按同一个字附近最深的笔画归一化，淡字、深字最后黑度接近；本来就深的像素不再改动；
       - 只改 Lab 亮度，彩色内容（红头、印章）保持色相；印章保护区不动；
-      - interp：细笔画插值（interp_strokes），把扫成一串断点的淡字连成连续笔画。
+      - interp：启用淡字恢复；text_method 选择定向灰度恢复或旧版骨架端点连接。
     """
     text, wide, band, ext_dark, char_h, bh, ds, lo, n_lines = find_text(img, bg)
     paper = float(np.mean(bg))
@@ -1066,14 +1354,12 @@ def enhance_text(img: np.ndarray, bg: tuple[int, int, int], keep: np.ndarray | N
     hi = np.maximum(hi, 2 * lo)
     # 判断“是不是淡字”时，行延伸出来的地方看源行：清楚的行延伸到的空白、透字不加深
     hi_fade = np.maximum(hi, ext_dark)
-    # 暗度达到 ENHANCE_FULL 的笔画一律加到全黑：旁边的深字不能把极淡的字压住
-    full = np.minimum(0.6 * hi, ENHANCE_FULL)
-    # 用黑帽值本身（不是平滑后的），否则深笔画周围的淡晕也会被加黑，字变粗变糊；
-    # 小核闭运算只补上笔画里扫断的一两个像素的缺口，不向外扩
-    kc = max(3, int(0.002 * side) | 1)
-    dd = cv2.morphologyEx(bh, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kc, kc)))
-    t = np.clip((dd - lo) / np.maximum(full - lo, 1), 0, 1) ** 0.7
-    m = cv2.GaussianBlur(cv2.dilate(text.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32), (0, 0), 1.0)
+    # 连续灰阶映射保留抗锯齿边缘，不做闭运算或低阈值饱和，避免描粗和粘连。
+    raw_peak = cv2.GaussianBlur(cv2.dilate(bh * text, np.ones((win, win), np.uint8)),
+                                (0, 0), max(1.0, char_h / 3))
+    full = np.maximum(0.55 * raw_peak, lo + 6.0)
+    t = np.clip((bh - lo) / (full - lo), 0, 1)
+    m = text.astype(np.float32)
     # 本来就清楚的字（附近最深的笔画已经够深）逐渐不再加深：只救淡字，不把正常的字描粗
     fade = np.clip((ENHANCE_CLEAR - hi_fade) / (ENHANCE_CLEAR - ENHANCE_FAINT), 0, 1)
     m *= fade
@@ -1083,13 +1369,19 @@ def enhance_text(img: np.ndarray, bg: tuple[int, int, int], keep: np.ndarray | N
     if interp:
         # 插值只给真正很淡的字用：清楚的字插值只会在笔画外描出一圈灰晕
         faint = np.clip((ENHANCE_INTERP_CLEAR - hi_fade) / (ENHANCE_INTERP_CLEAR - ENHANCE_INTERP_FAINT), 0, 1)
-        v = np.maximum(v, interp_strokes(bh, band, char_h, side, lo, keep) * faint)
+        log.info("  淡字恢复: %s", "16方向灰度线滤波" if text_method == "directional" else "骨架端点连接")
+        reconstruct = directional_strokes if text_method == "directional" else interp_strokes
+        reconstructed = reconstruct(bh, band, char_h, side, lo, keep)
+        v = v * (1 - faint) + reconstructed * faint * fade
     g = gray.astype(np.float32)
     # 只往深里改：已经比目标深的像素不动
     drop = np.maximum(g - (paper - v * (paper - ENHANCE_INK)), 0)
     lab_img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab_img[..., 0] = np.clip(lab_img[..., 0] - drop, 0, 255)  # OpenCV 8 位 Lab 的 L 也是 0~255
-    out = cv2.cvtColor(np.round(lab_img).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    out = img.copy()
+    changed = drop > 0
+    converted = cv2.cvtColor(np.round(lab_img).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    out[changed] = converted[changed]
     log.info("  增强: 正文行 %d 行，字高 %.0fpx，加深 %.2f%% 的面积（暗度下限 %.1f）",
              n_lines, char_h, 100 * float((drop > 30).mean()), lo)
     return out, wide.astype(np.uint8) * 255
@@ -1276,23 +1568,42 @@ def deskew(img: np.ndarray, angle: float, bg: tuple[int, int, int], keep: np.nda
     """按 angle（逆时针为正）旋转校正，空角用周围纸张纹理修补。
     返回 (校正后的图, 同样变换后的印章保护掩码, 同样变换后的已清除黑边区域)。
 
-    默认保持原尺寸；若这样会把任何内容像素转出画布，则扩展画布以完整保留内容。
-    骑缝章本来就被图片边缘截断，再转出去几个像素不算丢内容，不为它扩展画布。
+    始终保持原尺寸（输出尺寸须与输入一致）：整体平移到转出画布的内容最少；剩下转出去的只能是
+    本来就被图片边缘截断的墨迹（截断的字、扫描残迹、骑缝章），否则宁可不校正。
     """
     H, W = img.shape[:2]
     M = cv2.getRotationMatrix2D((W / 2, H / 2), angle, 1.0)
-    ys, xs = np.nonzero(content_mask(img, float(np.mean(bg))) & cv2.bitwise_not(keep))
+    content = content_mask(img, float(np.mean(bg))) & cv2.bitwise_not(keep)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(content, connectivity=8)
+    x, y, w, h = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
+    # 本来就被图片边缘截断的墨迹（截断的字、扫描残迹）和比标点还小的零星墨点再转出去一点不算丢内容
+    spare = (x == 0) | (y == 0) | (x + w == W) | (y + h == H) | (st[:, 4] < max(30, int(H * W * 1e-5)))
+    ys, xs = np.nonzero(content)
+    whole = ~spare[lab[ys, xs]]
     nx = M[0, 0] * xs + M[0, 1] * ys + M[0, 2]
     ny = M[1, 0] * xs + M[1, 1] * ys + M[1, 2]
-    lost = int(((nx < 0) | (nx > W - 1) | (ny < 0) | (ny > H - 1)).sum())
+    shift = [0, 0]
+    for k, (v, size_) in enumerate(((nx, W), (ny, H))):
+        if not len(v):
+            continue
+        cand = np.arange(int(np.floor(min(0.0, size_ - 1 - v.max()))), int(np.ceil(max(0.0, -v.min()))) + 1)
+
+        def lost(vv: np.ndarray) -> np.ndarray:  # 每个平移量下转出画布的像素数
+            sv = np.sort(vv)
+            return np.searchsorted(sv, -cand, "left") + len(sv) - np.searchsorted(sv, size_ - 1 - cand, "right")
+        # 先保完整内容，再少丢截断的墨迹，最后平移越小越好
+        lw, la = lost(v[whole]), lost(v)
+        d = int(cand[np.lexsort((np.abs(cand), la, lw))[0]])
+        shift[k] = d
+        M[k, 2] += d
+        v += d
+    gone = (nx < 0) | (nx > W - 1) | (ny < 0) | (ny > H - 1)
+    out_whole, out_any = int((gone & whole).sum()), int(gone.sum())
+    if out_whole:
+        log.info("  倾斜: 校正会把 %d 个完整内容的像素转出画布，为保持尺寸且不丢内容，不校正", out_whole)
+        return img, keep, cleaned
+    log.info("  倾斜: 平移 (%d, %d) 像素，转出画布的只有 %d 个贴边截断墨迹、零星墨点的像素", *shift, out_any)
     size = (W, H)
-    if lost:
-        c, s = abs(M[0, 0]), abs(M[0, 1])
-        nW, nH = int(np.ceil(W * c + H * s)), int(np.ceil(W * s + H * c))
-        M[0, 2] += (nW - W) / 2
-        M[1, 2] += (nH - H) / 2
-        size = (nW, nH)
-        log.info("  倾斜: 原尺寸旋转会切掉 %d 个内容像素，改为扩展画布 %dx%d → %dx%d", lost, W, H, nW, nH)
     out = cv2.warpAffine(img, M, size, flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT,
                          borderValue=bg)
     # 旋转后露出的空角（原图之外的区域），外扩几个像素覆盖插值造成的接缝
@@ -1348,7 +1659,7 @@ def process(path: Path, args: argparse.Namespace) -> bool:
 
     # 4. 淡字加深：在去噪之前做，去噪才能按完整的字确定版心和字高，不会把淡字当成淡色痕迹抹掉
     if args.enhance:
-        out, text = enhance_text(out, bg, keep, args.interp)
+        out, text = enhance_text(out, bg, keep, args.interp, args.text_method)
     else:
         text = np.zeros(out.shape[:2], np.uint8)
         log.info("  增强: 已关闭")
@@ -1384,7 +1695,9 @@ def main() -> int:
     ap.add_argument("--no-denoise", dest="denoise", action="store_false", help="关闭版心外去噪点（默认开启）")
     ap.add_argument("--no-enhance", dest="enhance", action="store_false", help="关闭正文淡字加深（默认开启）")
     ap.add_argument("--no-interp", dest="interp", action="store_false",
-                    help="关闭淡字的细笔画插值，只按像素加深（默认开启）")
+                    help="关闭淡字的细笔画插值和断笔修复，只按像素加深（默认开启）")
+    ap.add_argument("--text-method", choices=("directional", "endpoint"), default="directional",
+                    help="淡字恢复算法：directional 定向灰度恢复（默认），endpoint 旧版骨架端点连接")
     ap.add_argument("-n", "--noise", type=float, default=NOISE_RATIO,
                     help=f"噪点阈值：孤立墨点最大尺寸占字高的比例，越大清除越多(默认{NOISE_RATIO})")
     ap.add_argument("-v", "--verbose", action="store_true", help="输出详细检测日志")
