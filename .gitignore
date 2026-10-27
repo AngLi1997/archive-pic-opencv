@@ -13,3 +13,4 @@ wheels/
 test/
 test2/
 output/
+.DS_Store
